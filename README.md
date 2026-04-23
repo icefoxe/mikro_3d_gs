@@ -1,8 +1,26 @@
 Python 3.10.11
 
 
+## To do:
+- [X] device cuda, sprawdzić, czy działa
+    - gpu umiera, out of memory. uczenie umiera też na cpu.
+- [ ] optymalizacja
+- [ ] radial distortion
+- [ ] pozostałe rodzaje kamer
+- [ ] base_scales
+- [ ] means_3d
+- [ ] \(Dodatowe) aproksymacja projekcji kowariancji Jacobianem projekcji
+- [ ] \(Dodatowe) składanie obrazu zamiast prostą sumą użyć alpha blending
+- [ ] trening wielowidokowy - w kazdej iteracji jest losowany widok
+- [ ] \(Dodatowe) inne sposoby na ocenę jakości
+
+
+
+
+## Podgląd
+
 ### camera.py
-przechwuje parametry kamery, przekształca punkty 3D do układu kamery, rzutuje punkty 3D na piksele obrazu
+Przechwuje parametry kamery, przekształca punkty 3D do układu kamery, rzutuje punkty 3D na piksele obrazu
 
 
 ### rendered.py
@@ -49,3 +67,18 @@ pozycję 3D, kolor RGB, błąd
 > As a rule of thumb, use the simplest model that adequately describes your lens. Overly complex models with many parameters can lead to degenerate or overfitted calibration, especially when few images share intrinsics. If in doubt, start with SIMPLE_RADIAL and inspect the reprojection errors in the model statistics.
 
 [Camera Models](https://colmap.github.io/cameras.html)
+
+
+
+
+## dodatkowe info
+
+sprawdź, czy pytorch widzi CUDA
+
+`python -c "import torch; print(torch.cuda.is_available())" `
+
+`nvidia-smi`
+
+dla mnie ok wersja do RTX2060
+`pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118`
+
