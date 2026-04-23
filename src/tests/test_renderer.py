@@ -3,8 +3,8 @@ import torch
 import sys
 sys.path.append("src")
 
-from mikro_3d_gs.camera import Camera
-from mikro_3d_gs.renderer import GaussianRenderer
+from mikro3dgs.camera import Camera
+from mikro3dgs.renderer import GaussianRenderer
 
 device = torch.device("cpu")
 

@@ -2,7 +2,7 @@ import torch
 import sys
 sys.path.append("src")
 
-from mikro_3d_gs.camera import Camera
+from mikro3dgs.camera import Camera
 
 device = torch.device("cpu")
 
