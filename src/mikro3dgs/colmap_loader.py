@@ -62,6 +62,8 @@ def build_intrinsics(camera_model: ColmapCameraModel) -> torch.Tensor:
     -PINHOLE: fx, fy, cx, cy
     -SIMPLE_RADIAL: f, cx, cy, k
     -RADIAL: f, cx, cy, k1, k2
+    
+    Bez pozostałych modeli, bo za trudne.
     """
 
     model = camera_model.model
@@ -85,7 +87,7 @@ def build_intrinsics(camera_model: ColmapCameraModel) -> torch.Tensor:
         [fx, 0.0, cx],
         [0.0, fy, cy],
         [0.0, 0.0, 1.0],
-    ], dtype=torch.float32)
+    ], dtype=torch.float32) #na razie radial distorion ignoruje
     return K
 
 class ColmapLoader:

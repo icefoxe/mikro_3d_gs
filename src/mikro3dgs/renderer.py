@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from typing import Optional
 
+from tqdm import tqdm
+
 import torch
 
 from mikro3dgs.camera import Camera
@@ -109,7 +111,8 @@ class GaussianRenderer:
 
         valid_indices = torch.where(inside_mask)[0]
 
-        for idx in valid_indices:
+        for idx in tqdm(valid_indices, desc="Rendering Gaussians"):
+
             center = uv[idx]
             color = colors[idx]
             alpha = opacities[idx] 
