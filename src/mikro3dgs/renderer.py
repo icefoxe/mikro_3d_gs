@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from mikro_3d_gs.camera import Camera
+from mikro3dgs.camera import Camera
 
 
 @dataclass
