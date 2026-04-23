@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 
+
 from tqdm import tqdm
 
 import torch
@@ -75,12 +76,14 @@ class GaussianRenderer:
         opacities: torch.Tensor,
         base_scales: torch.Tensor,
         background: Optional[torch.Tensor] = None,
+        sigma_extent: float = 3.0,
     ) -> RenderOutput:
         """
-        renderuje obraz jako sumę 2D Gaussian splats
+        Szybszy render, kazdy gaussian liczony tylko w lokalnym oknie, a nie na całym obrazie, ale bez mipmap i innych bajerów.
+        Renderuje obraz jako sumę 2D Gaussian splats
 
-        każdy punkt 3D staje się Gaussianem 2D, rozmiar splatu zależy od głębokości
-        składanie jest przez ważoną sumę + alpha normalization
+        Każdy punkt 3D staje się Gaussianem 2D, rozmiar splatu zależy od głębokości
+        Składanie jest przez ważoną sumę + alpha normalization
         """
 
         means_3d = means_3d.to(self.device).float()
@@ -98,7 +101,6 @@ class GaussianRenderer:
             raise ValueError("base_scales must match number of gaussians")
 
         H, W = camera.image_size
-        grid = self._make_pixel_grid(H, W)
 
         uv, depth, valid_mask = camera.project(means_3d)
         inside_mask = camera.in_image_mask(uv, valid_mask)
@@ -109,7 +111,7 @@ class GaussianRenderer:
         image_acc = torch.zeros((H, W, 3), device=self.device, dtype=torch.float32)
         alpha_acc = torch.zeros((H, W, 1), device=self.device, dtype=torch.float32)
 
-        valid_indices = torch.where(inside_mask)[0]
+        valid_indices = torch.where(inside_mask)[0].tolist()
 
         for idx in tqdm(valid_indices, desc="Rendering Gaussians"):
 
@@ -117,12 +119,32 @@ class GaussianRenderer:
             color = colors[idx]
             alpha = opacities[idx] 
             sigma = sigma_2d[idx] 
-            diff = grid - center.view(1, 1, 2)  
-            dist2 = (diff ** 2).sum(dim=-1, keepdim=True)
+
+            u0 = center[0].item()
+            v0 = center[1].item()
+
+            radius = max(1, int(sigma_extent * sigma))
+
+            x_min = max(0, int(u0) - radius)
+            y_min = max(0, int(v0) - radius)
+            x_max = min(W, int(u0) + radius + 1)
+            y_max = min(H, int(v0) + radius + 1)
+
+            if x_min >= x_max or y_min >= y_max:
+                continue
+
+            ys = torch.arange(y_min, y_max, device=self.device, dtype=torch.float32)
+            xs = torch.arange(x_min, x_max, device=self.device, dtype=torch.float32)
+            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+            du = grid_x - center[0]
+            dv = grid_y - center[1]
+            dist2 = (du ** 2 + dv ** 2).unsqueeze(-1)
+
             gaussian = torch.exp(-0.5 * dist2 / (sigma ** 2 + 1e-6))
             weight = alpha.view(1, 1, 1) * gaussian     
-            image_acc = image_acc + weight * color.view(1, 1, 3)
-            alpha_acc = alpha_acc + weight
+            image_acc[y_min:y_max, x_min:x_max] += weight * color.view(1, 1, 3)
+            alpha_acc[y_min:y_max, x_min:x_max] += weight
 
         if background is None:
             background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
