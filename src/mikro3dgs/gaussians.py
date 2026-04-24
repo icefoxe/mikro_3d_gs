@@ -4,6 +4,11 @@ import torch
 import torch.nn as nn
 
 
+def inverse_sigmoid(x: torch.Tensor, eps:float=1e-6) -> torch.Tensor:
+        # poprawia inicjalizację opacities i kolorów, żeby były w zakresie (0, 1) po sigmoidzie, ale nie dokładnie 0 lub 1
+        x = torch.clamp(x, eps, 1.0 - eps) #zapobiegamy wartościom dokładnie 0 lub 1, bo wtedy inverse sigmoid daje inf
+        return torch.log(x / (1 - x))
+
 @dataclass
 class GaussianParameters:
     means_3d: torch.Tensor
@@ -30,7 +35,7 @@ class GaussianModel(nn.Module):
         learn_means: bool = False,
         learn_colors: bool = True,
         learn_opacities: bool = True,
-        learn_scales: bool = False,
+        learn_scales: bool = True,
         # na razie nie uczymy wszystkiego bo geometria COLMAP jest ok, a tak łatwiej sprawdzić czy renderowanie i treninig działa
     ) -> None:
         super().__init__()
@@ -41,8 +46,8 @@ class GaussianModel(nn.Module):
         base_scales = base_scales.float().reshape(-1, 1) #przekształcamy do (N, 1) żeby potem łatwiej było mnożyć przez jakieś skalowanie
 
         self.means_3d = nn.Parameter(means_3d, requires_grad=learn_means)
-        self.colors_raw = nn.Parameter(colors, requires_grad=learn_colors)
-        self.opacities_raw = nn.Parameter(opacities, requires_grad=learn_opacities)
+        self.colors_raw = nn.Parameter(inverse_sigmoid(colors), requires_grad=learn_colors)
+        self.opacities_raw = nn.Parameter(inverse_sigmoid(opacities), requires_grad=learn_opacities)
         self.base_scales_raw = nn.Parameter(base_scales, requires_grad=learn_scales)
 
     def get_parameters(self) -> GaussianParameters:
@@ -59,3 +64,5 @@ class GaussianModel(nn.Module):
             opacities=opacities,
             base_scales=base_scales,
         )
+    
+    

@@ -29,13 +29,18 @@ def main() -> None:
 
     xyz, rgb = loader.get_points_xyz_rgb()
 
-    max_points = 3000
-    perm = torch.randperm(xyz.shape[0])[:max_points]
-    xyz = xyz[perm]
-    rgb = rgb[perm]
     
     colmap_img = loader.get_first_image()
     camera = loader.build_camera(colmap_img)
+
+    uv, depth, valid_mask = camera.project(xyz)
+    inside_mask = camera.in_image_mask(uv, valid_mask)
+    visible_idx = torch.where(inside_mask)[0]
+    max_points = 2000
+    perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
+    xyz = xyz[perm]
+    rgb = rgb[perm]
+
 
     print("Training on image:", colmap_img.name)
     print("Points:", xyz.shape[0])
@@ -64,7 +69,7 @@ def main() -> None:
         learn_means=False,
         learn_colors=True,
         learn_opacities=True,
-        learn_scales=False,
+        learn_scales=True,
     ).to(device)
 
     renderer = GaussianRenderer(device=device)
@@ -73,7 +78,7 @@ def main() -> None:
 
 
 
-    num_iterations = 200
+    num_iterations = 100
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
@@ -89,7 +94,9 @@ def main() -> None:
         )
 
         pred_image = render_output.image
-        loss = mse_loss(render_output.image, target_image)
+
+        mask = (render_output.alpha > 1e-4).float()
+        loss = ((pred_image - target_image) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
         loss.backward()
         optimizer.step()
 
@@ -104,17 +111,17 @@ def main() -> None:
 
     plt.figure(figsize=(10, 5))
 
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.imshow(target_image.detach().cpu().numpy())
     plt.title("Target Image")
     plt.axis("off")
 
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.imshow(pred_image.detach().cpu().numpy())
     plt.title(f"Predicted Image\nStep {step}, Loss: {loss.item():.6f}")
     plt.axis("off")
 
-    plt.subplot(1, 2, 3)
+    plt.subplot(1, 3, 3)
     plt.plot(losses)
     plt.title("Loss")
     plt.xlabel("Step")

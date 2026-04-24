@@ -151,10 +151,8 @@ class GaussianRenderer:
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
-        image = image_acc / (alpha_acc + 1e-8)
-        image = image * (alpha_acc > 1e-8).float() + background * (alpha_acc <= 1e-8).float()
 
-        image = torch.clamp(image, 0.0, 1.0)
+        image = image_acc / (alpha_acc + 1e-8)
         alpha_acc = torch.clamp(alpha_acc, 0.0, 1.0)
 
         return RenderOutput(
