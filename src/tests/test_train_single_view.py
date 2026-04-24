@@ -36,7 +36,7 @@ def main() -> None:
     uv, depth, valid_mask = camera.project(xyz)
     inside_mask = camera.in_image_mask(uv, valid_mask)
     visible_idx = torch.where(inside_mask)[0]
-    max_points = 2000
+    max_points = 4000
     perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
     xyz = xyz[perm]
     rgb = rgb[perm]
@@ -78,36 +78,54 @@ def main() -> None:
 
 
 
-    num_iterations = 100
+    num_iterations = 1000
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
         optimizer.zero_grad()
 
         params = model.get_parameters()
-        render_output = renderer.render(
+
+
+        patch_size = 64
+
+        patch_x = torch.randint(low=0, high=camera.width - patch_size, size=(1,)).item()
+        patch_y = torch.randint(low=0, high=camera.height - patch_size, size=(1,)).item()
+
+        render_output = renderer.render_patch(
             means_3d=params.means_3d,
             colors=params.colors,
             opacities=params.opacities,
             base_scales=params.base_scales,
             camera=camera,
+            patch_x=patch_x,
+            patch_y=patch_y,
+            patch_size=patch_size,
         )
 
-        pred_image = render_output.image
+        pred_patch = render_output.image
+        target_patch = target_image[patch_y:patch_y+patch_size, patch_x:patch_x+patch_size]
 
         mask = (render_output.alpha > 1e-4).float()
-        loss = ((pred_image - target_image) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
+        loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
         loss.backward()
         optimizer.step()
 
         losses.append(loss.item())
 
         if step % 20 == 0 or step == num_iterations - 1:
+            final_out = renderer.render(
+                camera=camera,
+                means_3d=params.means_3d,
+                colors=params.colors,
+                opacities=params.opacities,
+                base_scales=params.base_scales,
+            )
             print(f"Step {step}, Loss: {loss.item():.6f}")
-            save_image_tensor(render_output.image, output_dir / f"render_{step:04d}.png")
+            save_image_tensor(final_out.image, output_dir / f"render_{step:04d}.png")
 
     save_image_tensor(target_image, output_dir / "target.png")
-    save_image_tensor(pred_image, output_dir / "final_render.png")
+    save_image_tensor(final_out.image, output_dir / "final_render.png")
 
     plt.figure(figsize=(10, 5))
 
@@ -117,7 +135,7 @@ def main() -> None:
     plt.axis("off")
 
     plt.subplot(1, 3, 2)
-    plt.imshow(pred_image.detach().cpu().numpy())
+    plt.imshow(final_out.image.detach().cpu().numpy())
     plt.title(f"Predicted Image\nStep {step}, Loss: {loss.item():.6f}")
     plt.axis("off")
 
