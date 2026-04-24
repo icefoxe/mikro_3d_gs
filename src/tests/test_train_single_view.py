@@ -28,6 +28,12 @@ def main() -> None:
     loader.load_all()
 
     xyz, rgb = loader.get_points_xyz_rgb()
+
+    max_points = 3000
+    perm = torch.randperm(xyz.shape[0])[:max_points]
+    xyz = xyz[perm]
+    rgb = rgb[perm]
+    
     colmap_img = loader.get_first_image()
     camera = loader.build_camera(colmap_img)
 
@@ -35,7 +41,11 @@ def main() -> None:
     print("Points:", xyz.shape[0])
 
     target_path = images_dir / colmap_img.name
-    target_image = load_image_as_tensor(target_path, device = device)
+    target_image = load_image_as_tensor(target_path, device = device, size = (480, 270))
+    camera.image_size = (270, 480)
+    camera.K[0, :] *= 480 /  1920
+    camera.K[1, :] *= 270 / 1080
+
 
     print("Target image shape:", target_image.shape)
     print("Camera image size:", camera.image_size)
@@ -89,29 +99,29 @@ def main() -> None:
             print(f"Step {step}, Loss: {loss.item():.6f}")
             save_image_tensor(render_output.image, output_dir / f"render_{step:04d}.png")
 
-        save_image_tensor(target_image, output_dir / "target.png")
-        save_image_tensor(pred_image, output_dir / "final_render.png")
+    save_image_tensor(target_image, output_dir / "target.png")
+    save_image_tensor(pred_image, output_dir / "final_render.png")
 
-        plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(10, 5))
 
-        plt.subplot(1, 2, 1)
-        plt.imshow(target_image.detach().cpu().numpy())
-        plt.title("Target Image")
-        plt.axis("off")
+    plt.subplot(1, 2, 1)
+    plt.imshow(target_image.detach().cpu().numpy())
+    plt.title("Target Image")
+    plt.axis("off")
 
-        plt.subplot(1, 2, 2)
-        plt.imshow(pred_image.detach().cpu().numpy())
-        plt.title(f"Predicted Image\nStep {step}, Loss: {loss.item():.6f}")
-        plt.axis("off")
+    plt.subplot(1, 2, 2)
+    plt.imshow(pred_image.detach().cpu().numpy())
+    plt.title(f"Predicted Image\nStep {step}, Loss: {loss.item():.6f}")
+    plt.axis("off")
 
-        plt.subplot(1, 2, 1)
-        plt.plot(losses)
-        plt.title("Loss")
-        plt.xlabel("Step")
-        plt.ylabel("MSE")
+    plt.subplot(1, 2, 3)
+    plt.plot(losses)
+    plt.title("Loss")
+    plt.xlabel("Step")
+    plt.ylabel("MSE")
 
-        plt.tight_layout()
-        plt.show()
+    plt.tight_layout()
+    plt.show()
 
 if __name__ == "__main__":    
     main()

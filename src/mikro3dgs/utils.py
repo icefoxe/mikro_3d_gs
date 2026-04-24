@@ -15,9 +15,13 @@ def save_image_tensor(image_tensor: torch.Tensor, output_path:str | Path) -> Non
 
 
 
-def load_image_as_tensor(image_path: str | Path, device: torch.device) -> torch.Tensor:
+def load_image_as_tensor(image_path: str | Path, device: torch.device, size = None) -> torch.Tensor:
     image_path = Path(image_path)
     image = Image.open(image_path).convert("RGB")
+
+    if image is not None:
+        image = image.resize(size)
+        
     image_np = np.asarray(image).astype(np.float32) / 255.0
     image_tensor = torch.from_numpy(image_np).to(device)
     return image_tensor
