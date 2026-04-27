@@ -33,9 +33,15 @@ def main() -> None:
     colmap_img = loader.get_first_image()
     camera = loader.build_camera(colmap_img)
 
-    uv, depth, valid_mask = camera.project(xyz)
-    inside_mask = camera.in_image_mask(uv, valid_mask)
-    visible_idx = torch.where(inside_mask)[0]
+    # uv, depth, valid_mask = camera.project(xyz)
+    # inside_mask = camera.in_image_mask(uv, valid_mask)
+    with torch.no_grad():
+        uv, depth, valid_mask = camera.project(xyz)
+        inside_mask = camera.in_image_mask(uv, valid_mask)
+        visible_idx = torch.where(inside_mask)[0]
+        visible_uv = uv[visible_idx]
+
+    
     max_points = 4000
     perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
     xyz = xyz[perm]
@@ -58,8 +64,8 @@ def main() -> None:
     if target_image.shape[0] != camera.image_size[0] or target_image.shape[1] != camera.image_size[1]:
         raise ValueError(f"Image side mismatch: target image has shape {target_image.shape}, but camera expects {camera.image_size}")
     
-    init_opacities = torch.ones((xyz.shape[0],), device=device) * 0.2
-    init_scales = torch.ones((xyz.shape[0],), device=device) * 0.003
+    init_opacities = torch.ones((xyz.shape[0],), device=device) * 0.6
+    init_scales = torch.ones((xyz.shape[0],), device=device) * 0.0008
 
     model = GaussianModel(
         means_3d=xyz,
@@ -78,7 +84,7 @@ def main() -> None:
 
 
 
-    num_iterations = 1000
+    num_iterations = 100
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
@@ -89,8 +95,17 @@ def main() -> None:
 
         patch_size = 64
 
-        patch_x = torch.randint(low=0, high=camera.width - patch_size, size=(1,)).item()
-        patch_y = torch.randint(low=0, high=camera.height - patch_size, size=(1,)).item()
+        j = torch.randint(0, visible_uv.shape[0], (1,)).item()
+        center = visible_uv[j]
+
+        patch_x = int(center[0].item() - patch_size // 2)
+        patch_y = int(center[1].item() - patch_size // 2)
+
+        patch_x = max(0, min(camera.width - patch_size, patch_x))
+        patch_y = max(0, min(camera.height - patch_size, patch_y))
+
+        # patch_x = torch.randint(low=0, high=camera.width - patch_size, size=(1,)).item()
+        # patch_y = torch.randint(low=0, high=camera.height - patch_size, size=(1,)).item()
 
         render_output = renderer.render_patch(
             means_3d=params.means_3d,
@@ -107,7 +122,34 @@ def main() -> None:
         target_patch = target_image[patch_y:patch_y+patch_size, patch_x:patch_x+patch_size]
 
         mask = (render_output.alpha > 1e-4).float()
-        loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
+
+        num_patches = 2
+        loss_total = 0.0
+        for _ in range(num_patches):
+            patch_x = torch.randint(low=0, high=camera.width - patch_size, size=(1,)).item()
+            patch_y = torch.randint(low=0, high=camera.height - patch_size, size=(1,)).item()
+
+            render_output = renderer.render_patch(
+                means_3d=params.means_3d,
+                colors=params.colors,
+                opacities=params.opacities,
+                base_scales=params.base_scales,
+                camera=camera,
+                patch_x=patch_x,
+                patch_y=patch_y,
+                patch_size=patch_size,
+            )
+
+            pred_patch = render_output.image
+            target_patch = target_image[patch_y:patch_y+patch_size, patch_x:patch_x+patch_size]
+
+            mask = (render_output.alpha > 1e-4).float()
+
+            patch_loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() * 3 + 1e-8)
+            loss_total += patch_loss
+
+        # loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
+        loss = loss_total / num_patches
         loss.backward()
         optimizer.step()
 
