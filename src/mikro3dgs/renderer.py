@@ -48,8 +48,8 @@ class GaussianRenderer:
         base_scales: torch.Tensor,
         depth: torch.Tensor,
         focal_length: float,
-        min_scale: float = 1.0,
-        max_scale: float = 50.0,
+        min_scale: float = 1.5,
+        max_scale: float = 8.0,
         eps: float = 1e-6,
     ) -> torch.Tensor:
         """
@@ -151,9 +151,15 @@ class GaussianRenderer:
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
+        color_avg = image_acc / (alpha_acc + 1e-8)
 
-        image = image_acc / (alpha_acc + 1e-8)
-        alpha_acc = torch.clamp(alpha_acc, 0.0, 1.0)
+        alpha_vis = 1.0 - torch.exp(-alpha_acc)
+        alpha_vis = torch.clamp(alpha_vis, 0.0, 1.0)
+
+        image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
+        image = torch.clamp(image, 0.0, 1.0)
+
+        alpha_acc = alpha_vis
 
         return RenderOutput(
             image=image,
@@ -220,7 +226,7 @@ class GaussianRenderer:
         image_acc = torch.zeros((patch_h, patch_w, 3), device=self.device, dtype=torch.float32)
         alpha_acc = torch.zeros((patch_h, patch_w, 1), device=self.device, dtype=torch.float32)
 
-        for idx in tqdm(valid_intdices, desc="Rendering patch Gaussians"):
+        for idx in valid_intdices:
 
             center = uv[idx]
             color = colors[idx]
@@ -264,11 +270,16 @@ class GaussianRenderer:
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
-        image = image_acc / (alpha_acc + 1e-8)
-        image = image * (alpha_acc > 1e-8).float() + background * (alpha_acc <= 1e-8).float()
-        image = torch.clamp(image, 0.0, 1.0)
-        alpha_acc = torch.clamp(alpha_acc, 0.0, 1.0)
+        
+        color_avg = image_acc / (alpha_acc + 1e-8)
 
+        alpha_vis = 1.0 - torch.exp(-alpha_acc)
+        alpha_vis = torch.clamp(alpha_vis, 0.0, 1.0)
+
+        image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
+        image = torch.clamp(image, 0.0, 1.0)
+
+        alpha_acc = alpha_vis
 
         return RenderOutput(
             image=image,

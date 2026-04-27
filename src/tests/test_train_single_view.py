@@ -33,8 +33,10 @@ def main() -> None:
     colmap_img = loader.get_first_image()
     camera = loader.build_camera(colmap_img)
 
-    # uv, depth, valid_mask = camera.project(xyz)
-    # inside_mask = camera.in_image_mask(uv, valid_mask)
+    camera.image_size = (270, 480)
+    camera.K[0, :] *= 480 /  1920
+    camera.K[1, :] *= 270 / 1080
+
     with torch.no_grad():
         uv, depth, valid_mask = camera.project(xyz)
         inside_mask = camera.in_image_mask(uv, valid_mask)
@@ -42,7 +44,7 @@ def main() -> None:
         visible_uv = uv[visible_idx]
 
     
-    max_points = 4000
+    max_points = 10000
     perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
     xyz = xyz[perm]
     rgb = rgb[perm]
@@ -53,9 +55,7 @@ def main() -> None:
 
     target_path = images_dir / colmap_img.name
     target_image = load_image_as_tensor(target_path, device = device, size = (480, 270))
-    camera.image_size = (270, 480)
-    camera.K[0, :] *= 480 /  1920
-    camera.K[1, :] *= 270 / 1080
+
 
 
     print("Target image shape:", target_image.shape)
@@ -64,15 +64,22 @@ def main() -> None:
     if target_image.shape[0] != camera.image_size[0] or target_image.shape[1] != camera.image_size[1]:
         raise ValueError(f"Image side mismatch: target image has shape {target_image.shape}, but camera expects {camera.image_size}")
     
-    init_opacities = torch.ones((xyz.shape[0],), device=device) * 0.6
-    init_scales = torch.ones((xyz.shape[0],), device=device) * 0.0008
+    init_opacities = torch.ones((xyz.shape[0],), device=device) * 0.9
+    with torch.no_grad():
+        uv, depth, valid_mask = camera.project(xyz)
+        fx = camera.K[0, 0]
+
+        target_sigma_px = 4.0
+        init_scales = target_sigma_px * depth / fx
+        init_scales = torch.clamp(init_scales, min=0.001, max=0.03)
+        
 
     model = GaussianModel(
         means_3d=xyz,
         colors=rgb,
         opacities=init_opacities,
         base_scales=init_scales,
-        learn_means=False,
+        learn_means=True,
         learn_colors=True,
         learn_opacities=True,
         learn_scales=True,
@@ -84,7 +91,7 @@ def main() -> None:
 
 
 
-    num_iterations = 100
+    num_iterations = 300
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
@@ -92,7 +99,17 @@ def main() -> None:
 
         params = model.get_parameters()
 
+        with torch.no_grad():
+            _, depth, _ = camera.project(params.means_3d)
+            sigma_2d = renderer.compute_2d_radius(
+                params.base_scales,
+                depth,
+                focal_length=camera.K[0, 0].item(),
+            )
 
+        # print("base_scales:", params.base_scales.min().item(), params.base_scales.mean().item(), params.base_scales.max().item())
+        # print("sigma_2d px:", sigma_2d.min().item(), sigma_2d.mean().item(), sigma_2d.max().item())
+                
         patch_size = 64
 
         j = torch.randint(0, visible_uv.shape[0], (1,)).item()

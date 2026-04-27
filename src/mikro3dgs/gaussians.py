@@ -9,6 +9,12 @@ def inverse_sigmoid(x: torch.Tensor, eps:float=1e-6) -> torch.Tensor:
         x = torch.clamp(x, eps, 1.0 - eps) #zapobiegamy wartościom dokładnie 0 lub 1, bo wtedy inverse sigmoid daje inf
         return torch.log(x / (1 - x))
 
+
+
+def inverse_softplus(x: torch.Tensor, eps:float=1e-6) -> torch.Tensor:
+    x = torch.clamp(x, min=eps)
+    return torch.log(torch.expm1(x))
+
 @dataclass
 class GaussianParameters:
     means_3d: torch.Tensor
@@ -48,7 +54,7 @@ class GaussianModel(nn.Module):
         self.means_3d = nn.Parameter(means_3d, requires_grad=learn_means)
         self.colors_raw = nn.Parameter(inverse_sigmoid(colors), requires_grad=learn_colors)
         self.opacities_raw = nn.Parameter(inverse_sigmoid(opacities), requires_grad=learn_opacities)
-        self.base_scales_raw = nn.Parameter(base_scales, requires_grad=learn_scales)
+        self.base_scales_raw = nn.Parameter(inverse_softplus(base_scales), requires_grad=learn_scales)
 
     def get_parameters(self) -> GaussianParameters:
 
