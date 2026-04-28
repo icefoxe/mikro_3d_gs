@@ -22,3 +22,5 @@ torch==2.11.0
 torchvision==0.26.0
 tqdm==4.67.3
 typing_extensions==4.15.0
+plotly==6.7.0
+narwhals==2.20.0

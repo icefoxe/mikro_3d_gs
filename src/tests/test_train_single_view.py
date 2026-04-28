@@ -10,8 +10,10 @@ sys.path.append("src")
 from mikro3dgs.colmap_loader import ColmapLoader
 from mikro3dgs.gaussians import GaussianModel
 from mikro3dgs.losses import mse_loss
-from mikro3dgs.utils import load_image_as_tensor, save_image_tensor
+from mikro3dgs.utils.utils import load_image_as_tensor, save_image_tensor
 from mikro3dgs.renderer import GaussianRenderer
+from mikro3dgs.utils.model_io import save_gaussian_model_npz, save_gaussian_splat_ply
+
 
 
 def main() -> None:
@@ -44,7 +46,7 @@ def main() -> None:
         visible_uv = uv[visible_idx]
 
     
-    max_points = 10000
+    max_points = 6000
     perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
     xyz = xyz[perm]
     rgb = rgb[perm]
@@ -91,7 +93,7 @@ def main() -> None:
 
 
 
-    num_iterations = 300
+    num_iterations = 100
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
@@ -120,9 +122,6 @@ def main() -> None:
 
         patch_x = max(0, min(camera.width - patch_size, patch_x))
         patch_y = max(0, min(camera.height - patch_size, patch_y))
-
-        # patch_x = torch.randint(low=0, high=camera.width - patch_size, size=(1,)).item()
-        # patch_y = torch.randint(low=0, high=camera.height - patch_size, size=(1,)).item()
 
         render_output = renderer.render_patch(
             means_3d=params.means_3d,
@@ -185,6 +184,24 @@ def main() -> None:
 
     save_image_tensor(target_image, output_dir / "target.png")
     save_image_tensor(final_out.image, output_dir / "final_render.png")
+
+    params = model.get_parameters()
+
+    save_gaussian_splat_ply(
+        output_dir / "gaussian_model_final.ply",
+        means_3d=params.means_3d,
+        colors=params.colors,
+        opacities=params.opacities,
+        base_scales=params.base_scales,
+    )
+
+    save_gaussian_model_npz(
+        output_dir / "gaussian_model_final.pt",
+        means_3d=params.means_3d,
+        colors=params.colors,
+        opacities=params.opacities,
+        base_scales=params.base_scales,
+    )
 
     plt.figure(figsize=(10, 5))
 

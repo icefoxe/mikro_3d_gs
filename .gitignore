@@ -163,3 +163,5 @@ Saved/
 *.rej
 *.txt
 *.png
+*.ply
+*.pt
