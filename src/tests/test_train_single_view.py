@@ -9,10 +9,9 @@ sys.path.append("src")
 
 from mikro3dgs.colmap_loader import ColmapLoader
 from mikro3dgs.gaussians import GaussianModel
-from mikro3dgs.losses import mse_loss
 from mikro3dgs.utils.utils import load_image_as_tensor, save_image_tensor
 from mikro3dgs.renderer import GaussianRenderer
-from mikro3dgs.utils.model_io import save_gaussian_model_npz, save_gaussian_splat_ply
+from mikro3dgs.utils.model_io import save_gaussian_model_pt, save_gaussian_splat_ply
 
 
 
@@ -46,7 +45,7 @@ def main() -> None:
         visible_uv = uv[visible_idx]
 
     
-    max_points = 6000
+    max_points = 10000
     perm = visible_idx[torch.randperm(len(visible_idx))[:max_points]]
     xyz = xyz[perm]
     rgb = rgb[perm]
@@ -74,17 +73,27 @@ def main() -> None:
         target_sigma_px = 4.0
         init_scales = target_sigma_px * depth / fx
         init_scales = torch.clamp(init_scales, min=0.001, max=0.03)
+        init_scales_3d = torch.stack(
+            [
+                init_scales * 1.0,
+                init_scales * 0.3,
+                init_scales * 0.1,
+            ],
+            dim=1,
+        )
+
         
 
     model = GaussianModel(
         means_3d=xyz,
         colors=rgb,
         opacities=init_opacities,
-        base_scales=init_scales,
+        scales_3d=init_scales_3d,
         learn_means=True,
         learn_colors=True,
         learn_opacities=True,
         learn_scales=True,
+        learn_rotations=True,
     ).to(device)
 
     renderer = GaussianRenderer(device=device)
@@ -93,7 +102,7 @@ def main() -> None:
 
 
 
-    num_iterations = 100
+    num_iterations = 500
     losses = []
 
     for step in tqdm(range(num_iterations), desc="Training single view"):
@@ -103,15 +112,15 @@ def main() -> None:
 
         with torch.no_grad():
             _, depth, _ = camera.project(params.means_3d)
+
+            debug_base_scales = params.scales_3d.mean(dim=1)
+
             sigma_2d = renderer.compute_2d_radius(
-                params.base_scales,
+                debug_base_scales,
                 depth,
                 focal_length=camera.K[0, 0].item(),
             )
-
-        # print("base_scales:", params.base_scales.min().item(), params.base_scales.mean().item(), params.base_scales.max().item())
-        # print("sigma_2d px:", sigma_2d.min().item(), sigma_2d.mean().item(), sigma_2d.max().item())
-                
+         
         patch_size = 64
 
         j = torch.randint(0, visible_uv.shape[0], (1,)).item()
@@ -127,7 +136,8 @@ def main() -> None:
             means_3d=params.means_3d,
             colors=params.colors,
             opacities=params.opacities,
-            base_scales=params.base_scales,
+            scales_3d=params.scales_3d,
+            rotations=params.rotations,
             camera=camera,
             patch_x=patch_x,
             patch_y=patch_y,
@@ -149,7 +159,8 @@ def main() -> None:
                 means_3d=params.means_3d,
                 colors=params.colors,
                 opacities=params.opacities,
-                base_scales=params.base_scales,
+                scales_3d=params.scales_3d,
+                rotations=params.rotations,
                 camera=camera,
                 patch_x=patch_x,
                 patch_y=patch_y,
@@ -159,17 +170,21 @@ def main() -> None:
             pred_patch = render_output.image
             target_patch = target_image[patch_y:patch_y+patch_size, patch_x:patch_x+patch_size]
 
-            mask = (render_output.alpha > 1e-4).float()
+            mask = 0.5 + 0.5 * (render_output.alpha > 1e-4).float()
 
             patch_loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() * 3 + 1e-8)
             loss_total += patch_loss
 
-        # loss = ((pred_patch - target_patch) ** 2 * mask).sum() / (mask.sum() *3 + 1e-8)
         loss = loss_total / num_patches
+        loss = loss + 0.01 * (1.0 / (params.scales_3d.mean() + 1e-6))
         loss.backward()
         optimizer.step()
 
         losses.append(loss.item())
+
+        if step % 10 == 0:
+            print("scale mean:", params.scales_3d.mean().item())
+            print("scale min/max:", params.scales_3d.min().item(), params.scales_3d.max().item())
 
         if step % 20 == 0 or step == num_iterations - 1:
             final_out = renderer.render(
@@ -177,7 +192,8 @@ def main() -> None:
                 means_3d=params.means_3d,
                 colors=params.colors,
                 opacities=params.opacities,
-                base_scales=params.base_scales,
+                scales_3d=params.scales_3d,
+                rotations=params.rotations,
             )
             print(f"Step {step}, Loss: {loss.item():.6f}")
             save_image_tensor(final_out.image, output_dir / f"render_{step:04d}.png")
@@ -192,15 +208,17 @@ def main() -> None:
         means_3d=params.means_3d,
         colors=params.colors,
         opacities=params.opacities,
-        base_scales=params.base_scales,
+        scales_3d=params.scales_3d,
+        rotations=params.rotations,
     )
 
-    save_gaussian_model_npz(
+    save_gaussian_model_pt(
         output_dir / "gaussian_model_final.pt",
         means_3d=params.means_3d,
         colors=params.colors,
         opacities=params.opacities,
-        base_scales=params.base_scales,
+        scales_3d=params.scales_3d,
+        rotations=params.rotations,
     )
 
     plt.figure(figsize=(10, 5))

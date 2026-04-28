@@ -20,7 +20,9 @@ class GaussianParameters:
     means_3d: torch.Tensor
     colors: torch.Tensor
     opacities: torch.Tensor
-    base_scales: torch.Tensor
+    scales_3d: torch.Tensor
+    rotations: torch.Tensor
+
 
 
 class GaussianModel(nn.Module):
@@ -37,24 +39,34 @@ class GaussianModel(nn.Module):
         means_3d: torch.Tensor,
         colors: torch.Tensor,
         opacities: torch.Tensor,
-        base_scales: torch.Tensor,
+        scales_3d: torch.Tensor,
+        rotations: torch.Tensor | None = None,
+
         learn_means: bool = False,
         learn_colors: bool = True,
         learn_opacities: bool = True,
         learn_scales: bool = True,
-        # na razie nie uczymy wszystkiego bo geometria COLMAP jest ok, a tak łatwiej sprawdzić czy renderowanie i treninig działa
+        learn_rotations: bool = True,
     ) -> None:
         super().__init__()
 
         means_3d = means_3d.float()
         colors = colors.float()
-        opacities = opacities.float().reshape(-1, 1) #przekształcamy do (N, 1) żeby potem łatwiej było mnożyć przez kolory
-        base_scales = base_scales.float().reshape(-1, 1) #przekształcamy do (N, 1) żeby potem łatwiej było mnożyć przez jakieś skalowanie
+        opacities = opacities.float().reshape(-1, 1)
+        scales_3d = scales_3d.float()
+
+        if rotations is None:
+            rotations = torch.zeros((means_3d.shape[0], 4), device=means_3d.device)
+            rotations[:, 0] = 1.0 # inicjalizacja jako brak rotacji (quaternion [1, 0, 0, 0])
+
+        rotations = rotations.float()
+        
 
         self.means_3d = nn.Parameter(means_3d, requires_grad=learn_means)
         self.colors_raw = nn.Parameter(inverse_sigmoid(colors), requires_grad=learn_colors)
         self.opacities_raw = nn.Parameter(inverse_sigmoid(opacities), requires_grad=learn_opacities)
-        self.base_scales_raw = nn.Parameter(inverse_softplus(base_scales), requires_grad=learn_scales)
+        self.scales_raw = nn.Parameter(inverse_softplus(scales_3d), requires_grad=learn_scales)
+        self.rotations_raw = nn.Parameter(rotations, requires_grad=learn_rotations)
 
     def get_parameters(self) -> GaussianParameters:
 
@@ -62,13 +74,17 @@ class GaussianModel(nn.Module):
 
         colors = torch.sigmoid(self.colors_raw)
         opacities = torch.sigmoid(self.opacities_raw).squeeze(-1)
-        base_scales = torch.nn.functional.softplus(self.base_scales_raw).squeeze(-1)
+        scales_3d = torch.nn.functional.softplus(self.scales_raw).squeeze(-1)
+
+        rotations = self.rotations_raw
+        rotations = rotations / (torch.norm(rotations, dim=-1, keepdim=True) + 1e-8) # normalizacja quaternionów
         
         return GaussianParameters(
             means_3d=self.means_3d,
             colors=colors,
             opacities=opacities,
-            base_scales=base_scales,
+            scales_3d=scales_3d,
+            rotations=rotations
         )
     
     

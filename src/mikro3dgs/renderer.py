@@ -67,6 +67,86 @@ class GaussianRenderer:
         sigma_2d = focal_length * base_scales / (depth + eps)
         sigma_2d = torch.clamp(sigma_2d, min=min_scale, max=max_scale)
         return sigma_2d
+    
+    def quaternion_to_rotmat(self, q: torch.Tensor) -> torch.Tensor:
+        """
+        q: (N, 4) jako [w, x, y, z]
+        returns: (N, 3, 3)
+        """
+        q = q / (q.norm(dim=1, keepdim=True) + 1e-8)
+
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+
+        R = torch.zeros((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
+
+        R[:, 0, 0] = 1 - 2 * (y * y + z * z)
+        R[:, 0, 1] = 2 * (x * y - w * z)
+        R[:, 0, 2] = 2 * (x * z + w * y)
+
+        R[:, 1, 0] = 2 * (x * y + w * z)
+        R[:, 1, 1] = 1 - 2 * (x * x + z * z)
+        R[:, 1, 2] = 2 * (y * z - w * x)
+
+        R[:, 2, 0] = 2 * (x * z - w * y)
+        R[:, 2, 1] = 2 * (y * z + w * x)
+        R[:, 2, 2] = 1 - 2 * (x * x + y * y)
+
+        return R
+
+
+    def compute_2d_covariances(
+        self,
+        camera: Camera,
+        means_3d: torch.Tensor,
+        scales_3d: torch.Tensor,
+        rotations: torch.Tensor,
+        eps: float = 1e-6,
+        min_var: float = 1.0,
+        max_var: float = 100.0,
+    ) -> torch.Tensor:
+        """
+        Liczy projekcję kowariancji 3D Gaussa do kowariancji 2D.
+
+        Sigma_3D = R_gauss @ diag(sx^2, sy^2, sz^2) @ R_gauss.T
+        Sigma_cam = R_camera @ Sigma_3D @ R_camera.T
+        Sigma_2D = J @ Sigma_cam @ J.T
+        """
+        means_3d = means_3d.to(self.device).float()
+        scales_3d = scales_3d.to(self.device).float()
+        rotations = rotations.to(self.device).float()
+
+        points_cam = camera.world_to_camera(means_3d)
+        X = points_cam[:, 0]
+        Y = points_cam[:, 1]
+        Z = torch.clamp(points_cam[:, 2], min=eps)
+
+        fx = camera.K[0, 0]
+        fy = camera.K[1, 1]
+
+        N = means_3d.shape[0]
+
+        # Jacobian projekcji 3D -> 2D
+        J = torch.zeros((N, 2, 3), device=self.device, dtype=torch.float32)
+        J[:, 0, 0] = fx / Z
+        J[:, 0, 2] = -fx * X / (Z * Z)
+        J[:, 1, 1] = fy / Z
+        J[:, 1, 2] = -fy * Y / (Z * Z)
+
+        R_gauss = self.quaternion_to_rotmat(rotations)
+
+        S2 = torch.diag_embed(scales_3d ** 2)
+        Sigma_world = R_gauss @ S2 @ R_gauss.transpose(1, 2)
+
+        R_cam = camera.R.to(self.device).float()
+        Sigma_cam = R_cam.unsqueeze(0) @ Sigma_world @ R_cam.T.unsqueeze(0)
+
+        Sigma_2d = J @ Sigma_cam @ J.transpose(1, 2)
+
+        eye = torch.eye(2, device=self.device).unsqueeze(0)
+
+        Sigma_2d = Sigma_2d + min_var * eye
+
+        return Sigma_2d
 
     def render(
         self,
@@ -74,9 +154,10 @@ class GaussianRenderer:
         means_3d: torch.Tensor,
         colors: torch.Tensor,
         opacities: torch.Tensor,
-        base_scales: torch.Tensor,
+        scales_3d: torch.Tensor,
         background: Optional[torch.Tensor] = None,
-        sigma_extent: float = 3.0,
+        sigma_extent: float = 3.0,     
+        rotations: Optional[torch.Tensor] = None,
     ) -> RenderOutput:
         """
         Szybszy render, kazdy gaussian liczony tylko w lokalnym oknie, a nie na całym obrazie, ale bez mipmap i innych bajerów.
@@ -89,7 +170,9 @@ class GaussianRenderer:
         means_3d = means_3d.to(self.device).float()
         colors = colors.to(self.device).float()
         opacities = opacities.to(self.device).float().reshape(-1, 1)
-        base_scales = base_scales.to(self.device).float().reshape(-1)
+        scales_3d = scales_3d.to(self.device).float()
+
+        
 
         if means_3d.ndim != 2 or means_3d.shape[1] != 3:
             raise ValueError(f"means_3d must have shape (N, 3), got {means_3d.shape}")
@@ -97,33 +180,62 @@ class GaussianRenderer:
             raise ValueError(f"colors must have shape (N, 3), got {colors.shape}")
         if opacities.shape[0] != means_3d.shape[0]:
             raise ValueError("opacities must match number of gaussians")
-        if base_scales.shape[0] != means_3d.shape[0]:
-            raise ValueError("base_scales must match number of gaussians")
+        if scales_3d.shape[0] != means_3d.shape[0]:
+            raise ValueError("scales_3d must match number of gaussians")
+        if scales_3d.ndim != 2 or scales_3d.shape[1] != 3:
+            raise ValueError(f"scales_3d must have shape (N, 3), got {scales_3d.shape}")
+        
+        if rotations is None:
+            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
+            rotations[:, 0] = 1.0
+        else:
+            rotations = rotations.to(self.device).float()
 
         H, W = camera.image_size
 
         uv, depth, valid_mask = camera.project(means_3d)
         inside_mask = camera.in_image_mask(uv, valid_mask)
 
-        fx = camera.K[0, 0].item()
-        sigma_2d = self.compute_2d_radius(base_scales, depth, focal_length=fx)
+        Sigma_2d = self.compute_2d_covariances(
+            camera=camera,
+            means_3d=means_3d,
+            scales_3d=scales_3d,
+            rotations=rotations,
+        )
+
+        eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
+        sigma_max = torch.sqrt(torch.clamp(eigvals[:, -1], min=1e-6))
+        margin = sigma_extent * sigma_max
 
         image_acc = torch.zeros((H, W, 3), device=self.device, dtype=torch.float32)
         alpha_acc = torch.zeros((H, W, 1), device=self.device, dtype=torch.float32)
 
-        valid_indices = torch.where(inside_mask)[0].tolist()
+        valid_mask_for_render = (
+            inside_mask &
+            (uv[:, 0] + margin >= 0) &
+            (uv[:, 0] - margin < W) &
+            (uv[:, 1] + margin >= 0) &
+            (uv[:, 1] - margin < H)
+
+        )
+
+        valid_indices = torch.where(valid_mask_for_render)[0].tolist()
+
+        eye2 = torch.eye(2, device=self.device, dtype=torch.float32)
 
         for idx in tqdm(valid_indices, desc="Rendering Gaussians"):
 
             center = uv[idx]
             color = colors[idx]
             alpha = opacities[idx] 
-            sigma = sigma_2d[idx] 
+
+            cov2d = Sigma_2d[idx] + eye2 * 1e-4
+            sigma = sigma_max[idx] 
 
             u0 = center[0].item()
             v0 = center[1].item()
 
-            radius = max(1, int(sigma_extent * sigma))
+            radius = max(1, int((sigma_extent * sigma).item()))
 
             x_min = max(0, int(u0) - radius)
             y_min = max(0, int(v0) - radius)
@@ -139,9 +251,19 @@ class GaussianRenderer:
 
             du = grid_x - center[0]
             dv = grid_y - center[1]
-            dist2 = (du ** 2 + dv ** 2).unsqueeze(-1)
 
-            gaussian = torch.exp(-0.5 * dist2 / (sigma ** 2 + 1e-6))
+            diff = torch.stack((du, dv), dim=2)  # (h, w, 2)
+
+            inv_cov = torch.linalg.inv(cov2d)
+
+            mahal = (
+                inv_cov[0, 0] * diff[..., 0] ** 2
+                + 2.0 * inv_cov[0, 1] * diff[..., 0] * diff[..., 1]
+                + inv_cov[1, 1] * diff[..., 1] ** 2
+            )
+
+            gaussian = torch.exp(-0.5 * mahal).unsqueeze(-1)
+
             weight = alpha.view(1, 1, 1) * gaussian     
             image_acc[y_min:y_max, x_min:x_max] += weight * color.view(1, 1, 3)
             alpha_acc[y_min:y_max, x_min:x_max] += weight
@@ -159,15 +281,14 @@ class GaussianRenderer:
         image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
         image = torch.clamp(image, 0.0, 1.0)
 
-        alpha_acc = alpha_vis
 
         return RenderOutput(
             image=image,
-            alpha=alpha_acc,
+            alpha=alpha_vis,
             uv=uv,
             depth=depth,
             valid_mask=valid_mask,
-            inside_mask=inside_mask,
+            inside_mask=valid_mask_for_render,
         )
     
 
@@ -177,10 +298,11 @@ class GaussianRenderer:
             means_3d: torch.Tensor,
             colors: torch.Tensor,
             opacities: torch.Tensor,
-            base_scales: torch.Tensor,
+            scales_3d: torch.Tensor,          
             patch_x: int,
             patch_y: int,
             patch_size: int,
+            rotations: Optional[torch.Tensor] = None,
             background: Optional[torch.Tensor] = None,
             sigma_extent: float = 3.0,
         )   -> RenderOutput:
@@ -190,7 +312,11 @@ class GaussianRenderer:
         means_3d = means_3d.to(self.device).float()
         colors = colors.to(self.device).float()
         opacities = opacities.to(self.device).float().reshape(-1, 1)
-        base_scales = base_scales.to(self.device).float().reshape(-1)
+        scales_3d = scales_3d.to(self.device).float()
+
+        if scales_3d.ndim != 2 or scales_3d.shape[1] != 3:
+            raise ValueError(f"scales_3d must have shape (N, 3), got {scales_3d.shape}")
+
 
         H_full, W_full = camera.image_size
 
@@ -208,17 +334,28 @@ class GaussianRenderer:
         uv, depth, valid_mask = camera.project(means_3d)
         inside_mask = camera.in_image_mask(uv, valid_mask)
 
-        fx = camera.K[0, 0].item()
-        sigma_2d = self.compute_2d_radius(base_scales, depth, focal_length=fx)
+        if rotations is None:
+            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
+            rotations[:, 0] = 1.0
 
-        margain = sigma_extent * sigma_2d
+        Sigma_2d = self.compute_2d_covariances(
+            camera=camera,
+            means_3d=means_3d,
+            scales_3d=scales_3d,
+            rotations=rotations,
+        )
+
+        # promień okna renderowania z największej wariancji 2D
+        eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
+        sigma_max = torch.sqrt(torch.clamp(eigvals[:, -1], min=1e-6))
+        margin = sigma_extent * sigma_max
 
         patch_mask = (
             inside_mask &
-            (uv[:, 0] + margain >= x0) &
-            (uv[:, 0] - margain < x1) &
-            (uv[:, 1] + margain >= y0) &
-            (uv[:, 1] - margain < y1)
+            (uv[:, 0] + margin >= x0) &
+            (uv[:, 0] - margin < x1) &
+            (uv[:, 1] + margin >= y0) &
+            (uv[:, 1] - margin < y1)
         )
 
         valid_intdices = torch.where(patch_mask)[0].tolist()
@@ -231,12 +368,13 @@ class GaussianRenderer:
             center = uv[idx]
             color = colors[idx]
             alpha = opacities[idx] 
-            sigma = sigma_2d[idx] 
+            cov2d = Sigma_2d[idx]
+            sigma = sigma_max[idx]
 
             u0 = center[0].item()
             v0 = center[1].item()
 
-            radius = max(1, int(sigma_extent * sigma))
+            radius = max(1, int((sigma_extent * sigma).item()))
 
             gx_min = max(x0, int(u0) - radius)
             gy_min = max(y0, int(v0) - radius)
@@ -252,9 +390,19 @@ class GaussianRenderer:
 
             du = grid_x - center[0]
             dv = grid_y - center[1]
-            dist2 = (du ** 2 + dv ** 2).unsqueeze(-1)
 
-            gaussian = torch.exp(-0.5 * dist2 / (sigma ** 2 + 1e-6))
+            diff = torch.stack((du, dv), dim=2)
+
+            cov2d = cov2d + torch.eye(2, device=self.device) * 1e-4
+            inv_cov = torch.linalg.inv(cov2d)
+
+            mahal = (
+                inv_cov[0, 0] * diff[..., 0] ** 2
+                + 2.0 * inv_cov[0, 1] * diff[..., 0] * diff[..., 1]
+                + inv_cov[1, 1] * diff[..., 1] ** 2
+            )
+
+            gaussian = torch.exp(-0.5 * mahal).unsqueeze(-1)
             weight = alpha.view(1, 1, 1) * gaussian  
 
             lx_min = gx_min - x0
