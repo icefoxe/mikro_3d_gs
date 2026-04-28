@@ -7,7 +7,7 @@ import sys
 sys.path.append("src")
 
 from mikro3dgs.colmap_loader import ColmapLoader
-from mikro3dgs.utils import save_image_tensor
+from mikro3dgs.utils.utils import save_image_tensor
 from mikro3dgs.renderer import GaussianRenderer
 
 
