@@ -17,7 +17,7 @@ from mikro3dgs.utils.model_io import save_gaussian_model_pt, save_gaussian_splat
 
 def main() -> None:
     # na razie cuda sie wypierdala bo out of memory
-    device = torch.device("cpu")
+    device = torch.device("cuda")
     print("Using device for training:", device)
 
     model_dir = Path("data/helga_test_1")
@@ -39,12 +39,12 @@ def main() -> None:
     for img in colmap_images:
         cam = loader.build_camera(img)
 
-        cam.image_size = (270, 480)
-        cam.K[0, :] *= 480 /  1920
-        cam.K[1, :] *= 270 / 1080
+        cam.image_size = (540, 960)
+        cam.K[0, :] *= 960 /  1920
+        cam.K[1, :] *= 540 / 1080
 
         target_path = images_dir / img.name
-        target_image = load_image_as_tensor(target_path, device = device, size = (480, 270))
+        target_image = load_image_as_tensor(target_path, device = device, size = (960, 540))
 
         cameras.append(cam)
         image_tensors.append(target_image)
@@ -53,7 +53,8 @@ def main() -> None:
 
 
 
-    max_points = 12000
+    max_points = min(40000, xyz.shape[0])
+
     if xyz.shape[0] > max_points:
         perm = torch.randperm(xyz.shape[0], device=device)[:max_points]
         xyz = xyz[perm]
@@ -90,7 +91,7 @@ def main() -> None:
         colors=rgb,
         opacities=init_opacities,
         scales_3d=init_scales_3d,
-        learn_means=True,
+        learn_means=False,
         learn_colors=True,
         learn_opacities=True,
         learn_scales=True,
@@ -99,24 +100,57 @@ def main() -> None:
 
     renderer = GaussianRenderer(device=device)
 
+    print("Precomputing projections")
+
+    projection_cache = []
+
+    with torch.no_grad():
+        params = model.get_parameters()
+
+        for cam in tqdm(cameras, desc="Caching projections"):
+            uv, depth, valid_mask = cam.project(params.means_3d)
+            inside_mask = cam.in_image_mask(uv, valid_mask)
+
+            projection_cache.append({
+                "uv": uv.detach(),
+                "depth": depth.detach(),
+                "inside_mask": inside_mask.detach(),
+            })
+
+    print("Projection cache ready.")
+
+    
+
     optimizer = torch.optim.Adam([
-        {"params": model.colors_raw, "lr": 1e-2},
-        {"params": model.opacities_raw, "lr": 5e-3},
-        {"params": model.scales_raw, "lr": 2e-3},
-        {"params": model.rotations_raw, "lr": 1e-3},
+        {"params": model.colors_raw, "lr": 1e-2, "name": "colors"},
+        {"params": model.opacities_raw, "lr": 5e-3, "name": "opacities"},
+        {"params": model.scales_raw, "lr": 0.0, "name": "scales"},
+        {"params": model.rotations_raw, "lr": 0.0, "name": "rotations"},
     ])
 
 
-
-    num_iterations = 5000
+    scale_rotation_start = 800
+    num_iterations = 20000
     patch_size = 96
-    num_patches = 2
+    num_patches = 4
+    
     losses = []
 
     final_out = None
     eval_view_idx = 0
 
     for step in tqdm(range(num_iterations), desc="Training multiview"):
+
+        if step == scale_rotation_start:
+            print("Enabling scale and rotation learning...")
+
+            for group in optimizer.param_groups:
+                if group.get("name") == "scales":
+                    group["lr"] = 2e-3
+                elif group.get("name") == "rotations":
+                    group["lr"] = 1e-3
+
+
         optimizer.zero_grad()
         params = model.get_parameters()
 
@@ -128,10 +162,10 @@ def main() -> None:
             camera = cameras[view_idx]
             target_image = image_tensors[view_idx]
 
-            with torch.no_grad():
-                uv, depth, valid_mask = camera.project(params.means_3d)
-                inside_mask = camera.in_image_mask(uv, valid_mask)
-                visible_idx = torch.where(inside_mask)[0]
+            cache = projection_cache[view_idx]
+            uv = cache["uv"]
+            inside_mask = cache["inside_mask"]
+            visible_idx = torch.where(inside_mask)[0]
 
             if visible_idx.numel() == 0:
                 continue
@@ -145,6 +179,26 @@ def main() -> None:
             patch_x = max(0, min(camera.width - patch_size, patch_x))
             patch_y = max(0, min(camera.height - patch_size, patch_y))
 
+            patch_margin = 16
+
+            candidate_mask = (
+                inside_mask
+                & (uv[:, 0] >= patch_x - patch_margin)
+                & (uv[:, 0] < patch_x + patch_size + patch_margin)
+                & (uv[:, 1] >= patch_y - patch_margin)
+                & (uv[:, 1] < patch_y + patch_size + patch_margin)
+            )
+
+            candidate_idx = torch.where(candidate_mask)[0]
+
+            if candidate_idx.numel() == 0:
+                continue
+
+            max_patch_points = 1000
+            if candidate_idx.numel() > max_patch_points:
+                sub = torch.randperm(candidate_idx.numel(), device=device)[:max_patch_points]
+                candidate_idx = candidate_idx[sub]
+
             render_output = renderer.render_patch(
                 camera=camera,
                 means_3d=params.means_3d,
@@ -155,6 +209,7 @@ def main() -> None:
                 patch_x=patch_x,
                 patch_y=patch_y,
                 patch_size=patch_size,
+                point_indices=candidate_idx,
             )
 
             pred_patch = render_output.image
@@ -193,7 +248,7 @@ def main() -> None:
         #     print("scale mean:", params.scales_3d.mean().item())
         #     print("scale min/max:", params.scales_3d.min().item(), params.scales_3d.max().item())
 
-        if step % 100 == 0 or step == num_iterations - 1:
+        if step % 2000 == 0 or step == num_iterations - 1:
             eval_camera = cameras[eval_view_idx]
             eval_target = image_tensors[eval_view_idx]
             eval_params = model.get_parameters()

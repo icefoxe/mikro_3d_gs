@@ -29,7 +29,7 @@ class GaussianRenderer:
     -generuje lokalny splat Gaussa na obrazie
     """
 
-    def __init__(self, device: torch.device = torch.device("cpu")) -> None:
+    def __init__(self, device: torch.device = torch.device("cuda")) -> None:
         self.device = device
 
     def _make_pixel_grid(self, height: int, width: int) -> torch.Tensor:
@@ -275,7 +275,7 @@ class GaussianRenderer:
 
         color_avg = image_acc / (alpha_acc + 1e-8)
 
-        alpha_vis = 1.0 - torch.exp(-alpha_acc)
+        alpha_vis = 1.0 - torch.exp(-0.3 * alpha_acc)
         alpha_vis = torch.clamp(alpha_vis, 0.0, 1.0)
 
         image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
@@ -293,50 +293,88 @@ class GaussianRenderer:
     
 
     def render_patch(
-            self, 
-            camera: Camera,
-            means_3d: torch.Tensor,
-            colors: torch.Tensor,
-            opacities: torch.Tensor,
-            scales_3d: torch.Tensor,          
-            patch_x: int,
-            patch_y: int,
-            patch_size: int,
-            rotations: Optional[torch.Tensor] = None,
-            background: Optional[torch.Tensor] = None,
-            sigma_extent: float = 3.0,
-        )   -> RenderOutput:
-        """Renderuje tylko fragment obrazu.
-        patch_x, patch_y to współrzędne lewego górnego rogu patcha
+        self,
+        camera: Camera,
+        means_3d: torch.Tensor,
+        colors: torch.Tensor,
+        opacities: torch.Tensor,
+        scales_3d: torch.Tensor,
+        patch_x: int,
+        patch_y: int,
+        patch_size: int,
+        rotations: Optional[torch.Tensor] = None,
+        point_indices: Optional[torch.Tensor] = None,
+        background: Optional[torch.Tensor] = None,
+        sigma_extent: float = 3.0,
+    ) -> RenderOutput:
         """
+        Wektorowy renderer patcha.
+
+        Zamiast pętli po Gaussianach:
+            for idx in valid_indices:
+        liczymy wkład wszystkich aktywnych Gaussianów naraz.
+
+        Uwaga:
+        - point_indices mocno zalecane
+        - max_patch_points w treningu powinno być np. 500–2000
+        """
+
         means_3d = means_3d.to(self.device).float()
         colors = colors.to(self.device).float()
-        opacities = opacities.to(self.device).float().reshape(-1, 1)
+        opacities = opacities.to(self.device).float().reshape(-1)
         scales_3d = scales_3d.to(self.device).float()
+
+        if rotations is not None:
+            rotations = rotations.to(self.device).float()
+
+        if point_indices is not None:
+            point_indices = point_indices.to(self.device).long()
+
+            means_3d = means_3d[point_indices]
+            colors = colors[point_indices]
+            opacities = opacities[point_indices]
+            scales_3d = scales_3d[point_indices]
+
+            if rotations is not None:
+                rotations = rotations[point_indices]
+
+        if means_3d.shape[0] == 0:
+            patch_h = patch_size
+            patch_w = patch_size
+            image = torch.zeros((patch_h, patch_w, 3), device=self.device)
+            alpha = torch.zeros((patch_h, patch_w, 1), device=self.device)
+            dummy = torch.empty((0,), device=self.device)
+            return RenderOutput(
+                image=image,
+                alpha=alpha,
+                uv=torch.empty((0, 2), device=self.device),
+                depth=dummy,
+                valid_mask=torch.empty((0,), dtype=torch.bool, device=self.device),
+                inside_mask=torch.empty((0,), dtype=torch.bool, device=self.device),
+            )
 
         if scales_3d.ndim != 2 or scales_3d.shape[1] != 3:
             raise ValueError(f"scales_3d must have shape (N, 3), got {scales_3d.shape}")
 
+        if rotations is None:
+            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
+            rotations[:, 0] = 1.0
 
         H_full, W_full = camera.image_size
 
-        patch_w = patch_size
-        patch_h = patch_size
-
         x0 = patch_x
         y0 = patch_y
-        x1 = min(W_full, x0 + patch_w)
-        y1 = min(H_full, y0 + patch_h)
+        x1 = min(W_full, x0 + patch_size)
+        y1 = min(H_full, y0 + patch_size)
 
         patch_w = x1 - x0
         patch_h = y1 - y0
 
+        if patch_w <= 0 or patch_h <= 0:
+            raise RuntimeError(f"Invalid patch size: patch_w={patch_w}, patch_h={patch_h}")
+
         uv, depth, valid_mask = camera.project(means_3d)
         inside_mask = camera.in_image_mask(uv, valid_mask)
-
-        if rotations is None:
-            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
-            rotations[:, 0] = 1.0
 
         Sigma_2d = self.compute_2d_covariances(
             camera=camera,
@@ -345,80 +383,70 @@ class GaussianRenderer:
             rotations=rotations,
         )
 
-        # promień okna renderowania z największej wariancji 2D
         eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
         sigma_max = torch.sqrt(torch.clamp(eigvals[:, -1], min=1e-6))
         margin = sigma_extent * sigma_max
 
         patch_mask = (
-            inside_mask &
-            (uv[:, 0] + margin >= x0) &
-            (uv[:, 0] - margin < x1) &
-            (uv[:, 1] + margin >= y0) &
-            (uv[:, 1] - margin < y1)
+            inside_mask
+            & (uv[:, 0] + margin >= x0)
+            & (uv[:, 0] - margin < x1)
+            & (uv[:, 1] + margin >= y0)
+            & (uv[:, 1] - margin < y1)
         )
 
-        valid_intdices = torch.where(patch_mask)[0].tolist()
+        active_idx = torch.where(patch_mask)[0]
 
-        image_acc = torch.zeros((patch_h, patch_w, 3), device=self.device, dtype=torch.float32)
-        alpha_acc = torch.zeros((patch_h, patch_w, 1), device=self.device, dtype=torch.float32)
-
-        for idx in valid_intdices:
-
-            center = uv[idx]
-            color = colors[idx]
-            alpha = opacities[idx] 
-            cov2d = Sigma_2d[idx]
-            sigma = sigma_max[idx]
-
-            u0 = center[0].item()
-            v0 = center[1].item()
-
-            radius = max(1, int((sigma_extent * sigma).item()))
-
-            gx_min = max(x0, int(u0) - radius)
-            gy_min = max(y0, int(v0) - radius)
-            gx_max = min(x1, int(u0) + radius + 1)
-            gy_max = min(y1, int(v0) + radius + 1)
-
-            if gx_min >= gx_max or gy_min >= gy_max:
-                continue
-
-            ys = torch.arange(gy_min, gy_max, device=self.device, dtype=torch.float32)
-            xs = torch.arange(gx_min, gx_max, device=self.device, dtype=torch.float32)
-            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-
-            du = grid_x - center[0]
-            dv = grid_y - center[1]
-
-            diff = torch.stack((du, dv), dim=2)
-
-            cov2d = cov2d + torch.eye(2, device=self.device) * 1e-4
-            inv_cov = torch.linalg.inv(cov2d)
-
-            mahal = (
-                inv_cov[0, 0] * diff[..., 0] ** 2
-                + 2.0 * inv_cov[0, 1] * diff[..., 0] * diff[..., 1]
-                + inv_cov[1, 1] * diff[..., 1] ** 2
+        if active_idx.numel() == 0:
+            image = torch.zeros((patch_h, patch_w, 3), device=self.device)
+            alpha = torch.zeros((patch_h, patch_w, 1), device=self.device)
+            return RenderOutput(
+                image=image,
+                alpha=alpha,
+                uv=uv,
+                depth=depth,
+                valid_mask=valid_mask,
+                inside_mask=patch_mask,
             )
 
-            gaussian = torch.exp(-0.5 * mahal).unsqueeze(-1)
-            weight = alpha.view(1, 1, 1) * gaussian  
+        uv_a = uv[active_idx]
+        colors_a = colors[active_idx]
+        opacities_a = opacities[active_idx]
+        Sigma_a = Sigma_2d[active_idx]
 
-            lx_min = gx_min - x0
-            ly_min = gy_min - y0
-            lx_max = gx_max - x0
-            ly_max = gy_max - y0
+        eye2 = torch.eye(2, device=self.device, dtype=torch.float32).unsqueeze(0)
+        Sigma_a = Sigma_a + eye2 * 1e-4
+        inv_cov = torch.linalg.inv(Sigma_a)
 
-            image_acc[ly_min:ly_max, lx_min:lx_max] += weight * color.view(1, 1, 3)
-            alpha_acc[ly_min:ly_max, lx_min:lx_max] += weight
+        ys = torch.arange(y0, y1, device=self.device, dtype=torch.float32)
+        xs = torch.arange(x0, x1, device=self.device, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+
+        du = grid_x.unsqueeze(0) - uv_a[:, 0].view(-1, 1, 1)
+        dv = grid_y.unsqueeze(0) - uv_a[:, 1].view(-1, 1, 1)
+
+        mahal = (
+            inv_cov[:, 0, 0].view(-1, 1, 1) * du ** 2
+            + 2.0 * inv_cov[:, 0, 1].view(-1, 1, 1) * du * dv
+            + inv_cov[:, 1, 1].view(-1, 1, 1) * dv ** 2
+        )
+
+        gaussian = torch.exp(-0.5 * mahal)
+
+        weights = opacities_a.view(-1, 1, 1) * gaussian
+
+        image_acc = torch.sum(
+            weights.unsqueeze(-1) * colors_a.view(-1, 1, 1, 3),
+            dim=0,
+        )  # (H, W, 3)
+
+        alpha_acc = torch.sum(weights, dim=0, keepdim=False).unsqueeze(-1)
 
         if background is None:
             background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
-        
         color_avg = image_acc / (alpha_acc + 1e-8)
 
         alpha_vis = 1.0 - torch.exp(-alpha_acc)
@@ -427,13 +455,11 @@ class GaussianRenderer:
         image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
         image = torch.clamp(image, 0.0, 1.0)
 
-        alpha_acc = alpha_vis
-
         return RenderOutput(
             image=image,
-            alpha=alpha_acc,
+            alpha=alpha_vis,
             uv=uv,
             depth=depth,
             valid_mask=valid_mask,
-            inside_mask=inside_mask,
+            inside_mask=patch_mask,
         )
