@@ -101,7 +101,7 @@ class GaussianRenderer:
         scales_3d: torch.Tensor,
         rotations: torch.Tensor,
         eps: float = 1e-6,
-        min_var: float = 1.0,
+        min_var: float = 0.05,
         max_var: float = 100.0,
     ) -> torch.Tensor:
         """
@@ -219,7 +219,11 @@ class GaussianRenderer:
 
         )
 
-        valid_indices = torch.where(valid_mask_for_render)[0].tolist()
+        valid_indices = torch.where(valid_mask_for_render)[0]
+
+        valid_indices = valid_indices[torch.argsort(depth[valid_indices], descending=True)]
+
+        valid_indices = valid_indices.tolist()
 
         eye2 = torch.eye(2, device=self.device, dtype=torch.float32)
 
@@ -264,21 +268,25 @@ class GaussianRenderer:
 
             gaussian = torch.exp(-0.5 * mahal).unsqueeze(-1)
 
-            weight = alpha.view(1, 1, 1) * gaussian     
-            image_acc[y_min:y_max, x_min:x_max] += weight * color.view(1, 1, 3)
-            alpha_acc[y_min:y_max, x_min:x_max] += weight
+            src_alpha = torch.clamp(alpha.view(1, 1, 1) * gaussian, 0.0, 0.99)
+
+            dst_alpha = alpha_acc[y_min:y_max, x_min:x_max]
+            transmittance = 1.0 - dst_alpha
+
+            image_acc[y_min:y_max, x_min:x_max] += (
+                transmittance * src_alpha * color.view(1, 1, 3)
+            )
+
+            alpha_acc[y_min:y_max, x_min:x_max] += transmittance * src_alpha
 
         if background is None:
             background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
-        color_avg = image_acc / (alpha_acc + 1e-8)
+        alpha_vis = torch.clamp(alpha_acc, 0.0, 1.0)
 
-        alpha_vis = 1.0 - torch.exp(-0.3 * alpha_acc)
-        alpha_vis = torch.clamp(alpha_vis, 0.0, 1.0)
-
-        image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
+        image = image_acc + background * (1.0 - alpha_vis)
         image = torch.clamp(image, 0.0, 1.0)
 
 
@@ -409,6 +417,9 @@ class GaussianRenderer:
                 inside_mask=patch_mask,
             )
 
+
+        active_idx = active_idx[torch.argsort(depth[active_idx], descending=True)]
+
         uv_a = uv[active_idx]
         colors_a = colors[active_idx]
         opacities_a = opacities[active_idx]
@@ -433,26 +444,44 @@ class GaussianRenderer:
 
         gaussian = torch.exp(-0.5 * mahal)
 
-        weights = opacities_a.view(-1, 1, 1) * gaussian
+        alpha = torch.clamp(
+            opacities_a.view(-1, 1, 1) * gaussian,
+            0.0,
+            0.25,
+        )
+
+
+        one_minus_alpha = 1.0 - alpha + 1e-8
+
+        T = torch.cumprod(
+            torch.cat(
+                [
+                    torch.ones_like(one_minus_alpha[:1]),
+                    one_minus_alpha[:-1],
+                ],
+                dim=0,
+            ),
+            dim=0,
+        )
+
+        weights = T * alpha 
 
         image_acc = torch.sum(
             weights.unsqueeze(-1) * colors_a.view(-1, 1, 1, 3),
             dim=0,
-        )  # (H, W, 3)
+        )
 
-        alpha_acc = torch.sum(weights, dim=0, keepdim=False).unsqueeze(-1)
+        alpha_acc = torch.sum(weights, dim=0).unsqueeze(-1)
+        alpha_acc = torch.clamp(alpha_acc, 0.0, 1.0)
 
         if background is None:
             background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
         else:
             background = background.to(self.device).float().view(1, 1, 3)
 
-        color_avg = image_acc / (alpha_acc + 1e-8)
+        alpha_vis = torch.clamp(alpha_acc, 0.0, 1.0)
 
-        alpha_vis = 1.0 - torch.exp(-alpha_acc)
-        alpha_vis = torch.clamp(alpha_vis, 0.0, 1.0)
-
-        image = color_avg * alpha_vis + background * (1.0 - alpha_vis)
+        image = image_acc + background * (1.0 - alpha_vis)
         image = torch.clamp(image, 0.0, 1.0)
 
         return RenderOutput(

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Tuple
 
 import torch
+import math
 
 
 @dataclass
@@ -110,3 +111,60 @@ class Camera:
         )
 
         return valid_mask & inside
+    
+def look_at(eye, target, up=None):
+    """
+    buduje macierz R i t dla kamery patrzącej na target
+    """
+    if up is None:
+        up = torch.tensor([0.0, 1.0, 0.0], device=eye.device)
+
+    eye = eye.float()
+    target = target.float()
+    up = up.float().to(eye.device)
+
+    z = (eye - target)
+    z = z / (torch.norm(z) + 1e-8)
+    
+    x = torch.cross(up, z, dim=0)
+    x = x / (torch.norm(x) + 1e-8)
+    y = torch.cross(z, x, dim=0)
+
+    R = torch.stack([x, y, z], dim=0)  # world -> camera
+
+    t = -R @ eye
+    print("poszlo")
+    return R, t
+
+def generate_orbit_cameras(base_camera, num_views=60, radius=2.0, target=None):
+    cameras = []
+
+    device = base_camera.device
+
+    if target is None:
+        target = torch.tensor([0.0, 0.0, 0.0], device=device)
+    else:
+        target = target.to(device)
+
+    for i in range(num_views):
+        angle = 2 * math.pi * i / num_views
+
+        eye = torch.tensor([
+            radius * math.cos(angle),
+            0.5,  # lekko z góry
+            radius * math.sin(angle)
+        ], device=device)
+
+        R, t = look_at(eye, target)
+    #pozycja kamer pojedyńczo z każdej kamery
+        cam = Camera(
+            K=base_camera.K.clone(),
+            R=R,
+            t=t,
+            image_size=base_camera.image_size,
+            device=device
+        )
+
+        cameras.append(cam)
+    print("poszlo")
+    return cameras

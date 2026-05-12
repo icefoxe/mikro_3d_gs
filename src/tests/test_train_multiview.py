@@ -1,28 +1,27 @@
 from pathlib import Path
 import torch
 import matplotlib.pyplot as plt
-
 from tqdm import tqdm
-
 import sys
 sys.path.append("src")
-
+import numpy as np
 from mikro3dgs.colmap_loader import ColmapLoader
 from mikro3dgs.gaussians import GaussianModel
 from mikro3dgs.utils.utils import load_image_as_tensor, save_image_tensor
 from mikro3dgs.renderer import GaussianRenderer
 from mikro3dgs.utils.model_io import save_gaussian_model_pt, save_gaussian_splat_ply
-
+from mikro3dgs.camera import Camera, look_at, generate_orbit_cameras
+from mikro3dgs.losses import combined_loss
 
 
 def main() -> None:
-    # na razie cuda sie wypierdala bo out of memory
+    #
     device = torch.device("cuda")
     print("Using device for training:", device)
 
-    model_dir = Path("data/helga_test_1")
+    model_dir = Path("data_car")
     images_dir = model_dir / "images"
-    output_dir = Path("output/train_multiview")
+    output_dir = Path("output")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     loader = ColmapLoader(model_dir = model_dir, device=device)
@@ -53,7 +52,7 @@ def main() -> None:
 
 
 
-    max_points = min(40000, xyz.shape[0])
+    max_points = min(24000, xyz.shape[0])
 
     if xyz.shape[0] > max_points:
         perm = torch.randperm(xyz.shape[0], device=device)[:max_points]
@@ -84,14 +83,14 @@ def main() -> None:
             dim=1,
         )
 
-        
+
 
     model = GaussianModel(
         means_3d=xyz,
         colors=rgb,
         opacities=init_opacities,
         scales_3d=init_scales_3d,
-        learn_means=False,
+        learn_means=True,
         learn_colors=True,
         learn_opacities=True,
         learn_scales=True,
@@ -122,15 +121,17 @@ def main() -> None:
     
 
     optimizer = torch.optim.Adam([
-        {"params": model.colors_raw, "lr": 1e-2, "name": "colors"},
+        {"params": model.colors_raw, "lr": 3e-3, "name": "colors"},
         {"params": model.opacities_raw, "lr": 5e-3, "name": "opacities"},
         {"params": model.scales_raw, "lr": 0.0, "name": "scales"},
         {"params": model.rotations_raw, "lr": 0.0, "name": "rotations"},
+        {"params": model.means_3d, "lr": 1e-4, "name": "means"},
+
     ])
 
 
     scale_rotation_start = 800
-    num_iterations = 20000
+    num_iterations = 2000
     patch_size = 96
     num_patches = 4
     
@@ -162,9 +163,10 @@ def main() -> None:
             camera = cameras[view_idx]
             target_image = image_tensors[view_idx]
 
-            cache = projection_cache[view_idx]
-            uv = cache["uv"]
-            inside_mask = cache["inside_mask"]
+            with torch.no_grad():
+                uv, depth, valid_mask = camera.project(params.means_3d)
+                inside_mask = camera.in_image_mask(uv, valid_mask)
+
             visible_idx = torch.where(inside_mask)[0]
 
             if visible_idx.numel() == 0:
@@ -179,7 +181,7 @@ def main() -> None:
             patch_x = max(0, min(camera.width - patch_size, patch_x))
             patch_y = max(0, min(camera.height - patch_size, patch_y))
 
-            patch_margin = 16
+            patch_margin = 32
 
             candidate_mask = (
                 inside_mask
@@ -194,7 +196,7 @@ def main() -> None:
             if candidate_idx.numel() == 0:
                 continue
 
-            max_patch_points = 1000
+            max_patch_points = 1500
             if candidate_idx.numel() > max_patch_points:
                 sub = torch.randperm(candidate_idx.numel(), device=device)[:max_patch_points]
                 candidate_idx = candidate_idx[sub]
@@ -220,14 +222,25 @@ def main() -> None:
 
             mask = 0.5 + 0.5 * (render_output.alpha > 1e-4).float()
 
+            """"
             l1 = (torch.abs(pred_patch - target_patch) * mask).sum() / (
                 mask.sum() * 3 + 1e-8
             )
             mse = (((pred_patch - target_patch) ** 2) * mask).sum() / (
                 mask.sum() * 3 + 1e-8
             )
+            
 
             patch_loss = 0.8 * l1 + 0.2 * mse
+            """
+            patch_loss = combined_loss(
+                pred=pred_patch,
+                target=target_patch,
+                mask=mask,
+                opacities=params.opacities[candidate_idx],
+                scales=params.scales_3d[candidate_idx],
+            )
+
             loss_total = loss_total + patch_loss
             valid_patch_count += 1
 
@@ -237,7 +250,10 @@ def main() -> None:
         loss = loss_total / valid_patch_count
 
         # lekka regularyzacja, żeby skale nie uciekały do zera
-        loss = loss + 0.001 * (1.0 / (params.scales_3d.mean() + 1e-6))
+        scale = params.scales_3d
+        loss = loss + 1e-4 * scale.mean()
+        loss = loss + 1e-4 * torch.relu(0.001 - scale).mean()
+
 
         loss.backward()
         optimizer.step()
@@ -248,7 +264,7 @@ def main() -> None:
         #     print("scale mean:", params.scales_3d.mean().item())
         #     print("scale min/max:", params.scales_3d.min().item(), params.scales_3d.max().item())
 
-        if step % 2000 == 0 or step == num_iterations - 1:
+        if step % 1000 == 0 or step == num_iterations - 1:
             eval_camera = cameras[eval_view_idx]
             eval_target = image_tensors[eval_view_idx]
             eval_params = model.get_parameters()
@@ -304,22 +320,66 @@ def main() -> None:
 
     plt.subplot(1, 3, 1)
     plt.imshow(image_tensors[eval_view_idx].detach().cpu().numpy())
-    plt.title("Target Image 0")
+    plt.title("Target Image")
     plt.axis("off")
 
     plt.subplot(1, 3, 2)
     plt.imshow(final_out.image.detach().cpu().numpy())
-    plt.title(f"Predicted Image 0 \nStep {step}, Loss: {loss.item():.6f}")
+    plt.title(f"Predicted Image \nStep {step}, Loss: {loss.item():.6f}")
     plt.axis("off")
 
     plt.subplot(1, 3, 3)
-    plt.plot(losses)
+    #plt.plot(losses)
     plt.title("Loss")
     plt.xlabel("Step")
     plt.ylabel("MSE")
 
     plt.tight_layout()
     plt.show()
+
+    print("Rendering orbit animation...")
+
+    center = params.means_3d.mean(dim=0)
+    scale = torch.norm(params.means_3d - center, dim=1).mean()
+    orbit_cams = generate_orbit_cameras(
+        cameras[0],
+        num_views=120,
+        radius=scale * 3.0,
+        target=center
+    )
+    print("Orbit cams:", len(orbit_cams))
+
+    for i, cam in enumerate(orbit_cams):
+        out = renderer.render(
+            camera=cam,
+            means_3d=params.means_3d,
+            colors=params.colors,
+            opacities=params.opacities,
+            scales_3d=params.scales_3d,
+            rotations=params.rotations,
+            )
+
+        save_image_tensor(out.image, output_dir / f"orbit_{i:04d}.png")
+
+    for i, cam in enumerate(orbit_cams):
+        print(cam.t)
+        break
+    import imageio
+
+    images = []
+    for i in range(len(orbit_cams)):
+        img = plt.imread(output_dir / f"orbit_{i:04d}.png")
+
+    # jeśli RGBA → RGB
+        if img.shape[-1] == 4:
+            img = img[..., :3]
+
+    # float → uint8
+        img = (img * 255).astype(np.uint8)
+
+        images.append(img)
+
+    imageio.mimsave(output_dir / "orbit.gif", images, fps=30)
 
 if __name__ == "__main__":    
     main()
