@@ -19,9 +19,9 @@ def main() -> None:
     device = torch.device("cuda")
     print("Using device for training:", device)
 
-    model_dir = Path("data_car")
+    model_dir = Path("data/helga_test_1")
     images_dir = model_dir / "images"
-    output_dir = Path("output")
+    output_dir = Path("output/train_multiview_2")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     loader = ColmapLoader(model_dir = model_dir, device=device)
@@ -90,7 +90,7 @@ def main() -> None:
         colors=rgb,
         opacities=init_opacities,
         scales_3d=init_scales_3d,
-        learn_means=True,
+        learn_means=False,
         learn_colors=True,
         learn_opacities=True,
         learn_scales=True,
@@ -123,15 +123,15 @@ def main() -> None:
     optimizer = torch.optim.Adam([
         {"params": model.colors_raw, "lr": 3e-3, "name": "colors"},
         {"params": model.opacities_raw, "lr": 5e-3, "name": "opacities"},
-        {"params": model.scales_raw, "lr": 0.0, "name": "scales"},
+        {"params": model.scales_raw, "lr": 3e-3, "name": "scales"},
         {"params": model.rotations_raw, "lr": 0.0, "name": "rotations"},
-        {"params": model.means_3d, "lr": 1e-4, "name": "means"},
+        # {"params": model.means_3d, "lr": 1e-4, "name": "means"},
 
     ])
 
 
-    scale_rotation_start = 800
-    num_iterations = 2000
+    scale_rotation_start = 200
+    num_iterations = 5000
     patch_size = 96
     num_patches = 4
     
@@ -143,13 +143,13 @@ def main() -> None:
     for step in tqdm(range(num_iterations), desc="Training multiview"):
 
         if step == scale_rotation_start:
-            print("Enabling scale and rotation learning...")
+            print("Enabling scale learning...")
 
             for group in optimizer.param_groups:
-                if group.get("name") == "scales":
-                    group["lr"] = 2e-3
-                elif group.get("name") == "rotations":
-                    group["lr"] = 1e-3
+                # if group.get("name") == "scales":
+                #     group["lr"] = 2e-3
+                if group.get("name") == "rotations":
+                    group["lr"] = 1e-2
 
 
         optimizer.zero_grad()
@@ -264,7 +264,7 @@ def main() -> None:
         #     print("scale mean:", params.scales_3d.mean().item())
         #     print("scale min/max:", params.scales_3d.min().item(), params.scales_3d.max().item())
 
-        if step % 1000 == 0 or step == num_iterations - 1:
+        if step % 500 == 0 or step == num_iterations - 1:
             eval_camera = cameras[eval_view_idx]
             eval_target = image_tensors[eval_view_idx]
             eval_params = model.get_parameters()
@@ -329,57 +329,16 @@ def main() -> None:
     plt.axis("off")
 
     plt.subplot(1, 3, 3)
-    #plt.plot(losses)
+    plt.plot(losses)
     plt.title("Loss")
     plt.xlabel("Step")
     plt.ylabel("MSE")
 
     plt.tight_layout()
+    plt.savefig(output_dir / "training_summary.png", dpi=160)
     plt.show()
 
-    print("Rendering orbit animation...")
 
-    center = params.means_3d.mean(dim=0)
-    scale = torch.norm(params.means_3d - center, dim=1).mean()
-    orbit_cams = generate_orbit_cameras(
-        cameras[0],
-        num_views=120,
-        radius=scale * 3.0,
-        target=center
-    )
-    print("Orbit cams:", len(orbit_cams))
-
-    for i, cam in enumerate(orbit_cams):
-        out = renderer.render(
-            camera=cam,
-            means_3d=params.means_3d,
-            colors=params.colors,
-            opacities=params.opacities,
-            scales_3d=params.scales_3d,
-            rotations=params.rotations,
-            )
-
-        save_image_tensor(out.image, output_dir / f"orbit_{i:04d}.png")
-
-    for i, cam in enumerate(orbit_cams):
-        print(cam.t)
-        break
-    import imageio
-
-    images = []
-    for i in range(len(orbit_cams)):
-        img = plt.imread(output_dir / f"orbit_{i:04d}.png")
-
-    # jeśli RGBA → RGB
-        if img.shape[-1] == 4:
-            img = img[..., :3]
-
-    # float → uint8
-        img = (img * 255).astype(np.uint8)
-
-        images.append(img)
-
-    imageio.mimsave(output_dir / "orbit.gif", images, fps=30)
 
 if __name__ == "__main__":    
     main()

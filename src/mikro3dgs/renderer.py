@@ -221,7 +221,8 @@ class GaussianRenderer:
 
         valid_indices = torch.where(valid_mask_for_render)[0]
 
-        valid_indices = valid_indices[torch.argsort(depth[valid_indices], descending=True)]
+        valid_indices = valid_indices[torch.argsort(depth[valid_indices], descending=False)]
+
 
         valid_indices = valid_indices.tolist()
 
@@ -418,7 +419,7 @@ class GaussianRenderer:
             )
 
 
-        active_idx = active_idx[torch.argsort(depth[active_idx], descending=True)]
+        active_idx = active_idx[torch.argsort(depth[active_idx], descending=False)]
 
         uv_a = uv[active_idx]
         colors_a = colors[active_idx]
@@ -464,7 +465,7 @@ class GaussianRenderer:
             dim=0,
         )
 
-        weights = T * alpha 
+        weights = T.detach() * alpha
 
         image_acc = torch.sum(
             weights.unsqueeze(-1) * colors_a.view(-1, 1, 1, 3),
