@@ -1,8 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
-
-
-from tqdm import tqdm
+import os
+import time
 
 import torch
 
@@ -20,79 +19,43 @@ class RenderOutput:
 
 
 class GaussianRenderer:
-    """
-    uproszczony renderer 3D
 
-    każdy punkt 3D:
-    -jest rzutowany do 2D
-    -dostaje promień zależny od głębokości
-    -generuje lokalny splat Gaussa na obrazie
-    """
-
-    def __init__(self, device: torch.device = torch.device("cuda")) -> None:
-        self.device = device
-
-    def _make_pixel_grid(self, height: int, width: int) -> torch.Tensor:
-        """
-        Tworzy siatkę pikseli o shape (H, W, 2),
-        gdzie ostatni wymiar to (u, v).
-        """
-        ys = torch.arange(height, device=self.device, dtype=torch.float32)
-        xs = torch.arange(width, device=self.device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        grid = torch.stack([grid_x, grid_y], dim=-1)
-        return grid
-
-    def compute_2d_radius(
+    def __init__(
         self,
-        base_scales: torch.Tensor,
-        depth: torch.Tensor,
-        focal_length: float,
-        min_scale: float = 1.5,
-        max_scale: float = 8.0,
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """
-        urposzczony model rozmiaru splatu 2d z tego wzoru:
-            sigma_2d = f * sigma_3d / z
+        device: torch.device = torch.device("cuda"),
+        tile_gaussians: int = 256,
+        full_image_tile_size: int = 128,
+        full_image_gaussian_chunk: int = 96,
+    ) -> None:
+        self.device = device
+        self.tile_gaussians = int(tile_gaussians)
+        self.full_image_tile_size = int(full_image_tile_size)
+        self.full_image_gaussian_chunk = int(full_image_gaussian_chunk)
+        self.debug = os.environ.get("MIKRO3DGS_RENDER_DEBUG", "0") == "1"
 
-        args:
-            base_scales: (N,) bazowy rozmiar Gaussa w 3D
-            depth: (N,) głębokość
-            focal_length: skalar, np. fx
-        returns:
-            sigma_2d: (N,)
-        """
+    def _dbg(self, msg: str) -> None:
+        if self.debug:
+            print(f"[renderer] {msg}", flush=True)
 
-        sigma_2d = focal_length * base_scales / (depth + eps)
-        sigma_2d = torch.clamp(sigma_2d, min=min_scale, max=max_scale)
-        return sigma_2d
-    
+    def _sync(self, label: str) -> None:
+        if self.debug and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+            print(f"[renderer] cuda sync after {label}", flush=True)
+
     def quaternion_to_rotmat(self, q: torch.Tensor) -> torch.Tensor:
-        """
-        q: (N, 4) jako [w, x, y, z]
-        returns: (N, 3, 3)
-        """
         q = q / (q.norm(dim=1, keepdim=True) + 1e-8)
-
         w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-
-        R = torch.zeros((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
-
+        R = torch.empty((q.shape[0], 3, 3), device=q.device, dtype=q.dtype)
         R[:, 0, 0] = 1 - 2 * (y * y + z * z)
         R[:, 0, 1] = 2 * (x * y - w * z)
         R[:, 0, 2] = 2 * (x * z + w * y)
-
         R[:, 1, 0] = 2 * (x * y + w * z)
         R[:, 1, 1] = 1 - 2 * (x * x + z * z)
         R[:, 1, 2] = 2 * (y * z - w * x)
-
         R[:, 2, 0] = 2 * (x * z - w * y)
         R[:, 2, 1] = 2 * (y * z + w * x)
         R[:, 2, 2] = 1 - 2 * (x * x + y * y)
-
         return R
-
 
     def compute_2d_covariances(
         self,
@@ -101,31 +64,19 @@ class GaussianRenderer:
         scales_3d: torch.Tensor,
         rotations: torch.Tensor,
         eps: float = 1e-6,
-        min_var: float = 0.05,
-        max_var: float = 100.0,
+        min_var: float = 0.25,
+        max_var: float = 4096.0,
     ) -> torch.Tensor:
-        """
-        Liczy projekcję kowariancji 3D Gaussa do kowariancji 2D.
-
-        Sigma_3D = R_gauss @ diag(sx^2, sy^2, sz^2) @ R_gauss.T
-        Sigma_cam = R_camera @ Sigma_3D @ R_camera.T
-        Sigma_2D = J @ Sigma_cam @ J.T
-        """
         means_3d = means_3d.to(self.device).float()
         scales_3d = scales_3d.to(self.device).float()
         rotations = rotations.to(self.device).float()
 
         points_cam = camera.world_to_camera(means_3d)
-        X = points_cam[:, 0]
-        Y = points_cam[:, 1]
-        Z = torch.clamp(points_cam[:, 2], min=eps)
-
-        fx = camera.K[0, 0]
-        fy = camera.K[1, 1]
+        X, Y = points_cam[:, 0], points_cam[:, 1]
+        Z = points_cam[:, 2].clamp_min(eps)
+        fx, fy = camera.K[0, 0], camera.K[1, 1]
 
         N = means_3d.shape[0]
-
-        # Jacobian projekcji 3D -> 2D
         J = torch.zeros((N, 2, 3), device=self.device, dtype=torch.float32)
         J[:, 0, 0] = fx / Z
         J[:, 0, 2] = -fx * X / (Z * Z)
@@ -133,20 +84,138 @@ class GaussianRenderer:
         J[:, 1, 2] = -fy * Y / (Z * Z)
 
         R_gauss = self.quaternion_to_rotmat(rotations)
-
-        S2 = torch.diag_embed(scales_3d ** 2)
+        S2 = torch.diag_embed(scales_3d * scales_3d)
         Sigma_world = R_gauss @ S2 @ R_gauss.transpose(1, 2)
-
         R_cam = camera.R.to(self.device).float()
         Sigma_cam = R_cam.unsqueeze(0) @ Sigma_world @ R_cam.T.unsqueeze(0)
-
         Sigma_2d = J @ Sigma_cam @ J.transpose(1, 2)
 
-        eye = torch.eye(2, device=self.device).unsqueeze(0)
-
+        eye = torch.eye(2, device=self.device, dtype=torch.float32).unsqueeze(0)
         Sigma_2d = Sigma_2d + min_var * eye
 
-        return Sigma_2d
+        eigvals, eigvecs = torch.linalg.eigh(Sigma_2d)
+        eigvals = eigvals.clamp(min=min_var, max=max_var)
+        return eigvecs @ torch.diag_embed(eigvals) @ eigvecs.transpose(1, 2)
+
+    def _prepare_inputs(self, means_3d, colors, opacities, scales_3d, rotations):
+        means_3d = means_3d.to(self.device).float()
+        colors = colors.to(self.device).float().clamp(0.0, 1.0)
+        opacities = opacities.to(self.device).float().reshape(-1)
+        scales_3d = scales_3d.to(self.device).float()
+        if rotations is None:
+            rotations = torch.zeros(
+                (means_3d.shape[0], 4), device=self.device, dtype=torch.float32
+            )
+            rotations[:, 0] = 1.0
+        else:
+            rotations = rotations.to(self.device).float()
+        return means_3d, colors, opacities, scales_3d, rotations
+
+    def _render_region_from_precomputed(
+        self,
+        uv: torch.Tensor,
+        depth: torch.Tensor,
+        valid_mask: torch.Tensor,
+        Sigma_2d: torch.Tensor,
+        colors: torch.Tensor,
+        opacities: torch.Tensor,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        background: Optional[torch.Tensor],
+        sigma_extent: float,
+        gaussian_chunk: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        t_region = time.perf_counter()
+        h, w = y1 - y0, x1 - x0
+        self._dbg(
+            f"region start x={x0}:{x1} y={y0}:{y1} size={w}x{h} gaussian_chunk={gaussian_chunk}"
+        )
+        image_acc = torch.zeros((h, w, 3), device=self.device, dtype=torch.float32)
+        alpha_acc = torch.zeros((h, w, 1), device=self.device, dtype=torch.float32)
+
+        self._dbg("region: before eigvalsh")
+        eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
+        self._sync("region eigvalsh")
+        sigma_max = torch.sqrt(eigvals[:, -1].clamp_min(1e-6))
+        margin = sigma_extent * sigma_max
+
+        inside = (
+            valid_mask
+            & (depth > 1e-5)
+            & (uv[:, 0] + margin >= x0)
+            & (uv[:, 0] - margin < x1)
+            & (uv[:, 1] + margin >= y0)
+            & (uv[:, 1] - margin < y1)
+        )
+        idx = torch.where(inside)[0]
+        self._sync("region candidate mask")
+        self._dbg(f"region: candidate gaussians={idx.numel()}")
+
+        if idx.numel() == 0:
+            if background is not None:
+                image_acc[:] = background.to(self.device).float().view(1, 1, 3)
+            return image_acc, alpha_acc, inside
+
+        self._dbg("region: before depth sort")
+        idx = idx[torch.argsort(depth[idx])]  # front-to-back
+        self._sync("region depth sort")
+        uv_a = uv[idx]
+        colors_a = colors[idx]
+        alpha_a = opacities[idx]
+        Sigma_a = Sigma_2d[idx]
+
+        ys = torch.arange(y0, y1, device=self.device, dtype=torch.float32)
+        xs = torch.arange(x0, x1, device=self.device, dtype=torch.float32)
+        gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+
+        T = torch.ones((h, w, 1), device=self.device, dtype=torch.float32)
+
+        chunk = max(1, int(gaussian_chunk))
+        for start in range(0, idx.numel(), chunk):
+            end = min(start + chunk, idx.numel())
+            if self.debug and (start == 0 or start % (chunk * 10) == 0):
+                self._dbg(f"region chunk {start}:{end}/{idx.numel()}")
+            self._dbg("chunk: before inv_cov") if self.debug and start == 0 else None
+            inv_cov = torch.linalg.inv(Sigma_a[start:end])
+            self._sync("chunk inv_cov first") if self.debug and start == 0 else None
+            uvc = uv_a[start:end]
+
+            du = gx.unsqueeze(0) - uvc[:, 0].view(-1, 1, 1)
+            dv = gy.unsqueeze(0) - uvc[:, 1].view(-1, 1, 1)
+            mahal = (
+                inv_cov[:, 0, 0].view(-1, 1, 1) * du * du
+                + 2.0 * inv_cov[:, 0, 1].view(-1, 1, 1) * du * dv
+                + inv_cov[:, 1, 1].view(-1, 1, 1) * dv * dv
+            )
+
+            self._sync("chunk mahal first") if self.debug and start == 0 else None
+            gauss = torch.exp(-0.5 * mahal)
+            alpha = (alpha_a[start:end].view(-1, 1, 1) * gauss).clamp(0.0, 0.995)
+            one_minus = (1.0 - alpha).clamp_min(1e-6)
+
+            local_T = torch.cumprod(
+                torch.cat([torch.ones_like(one_minus[:1]), one_minus[:-1]], dim=0),
+                dim=0,
+            )
+            weights = T.permute(2, 0, 1) * local_T * alpha
+
+            image_acc = image_acc + torch.sum(
+                weights.unsqueeze(-1) * colors_a[start:end].view(-1, 1, 1, 3),
+                dim=0,
+            )
+            alpha_acc = alpha_acc + torch.sum(weights, dim=0).unsqueeze(-1)
+            T = T * torch.prod(one_minus, dim=0).unsqueeze(-1)
+
+        self._sync("region chunks done")
+        self._dbg(f"region chunks done in {time.perf_counter() - t_region:.3f}s")
+        alpha_acc = alpha_acc.clamp(0.0, 1.0)
+        if background is not None:
+            bg = background.to(self.device).float().view(1, 1, 3)
+            image_acc = image_acc + bg * (1.0 - alpha_acc)
+
+        return image_acc.clamp(0.0, 1.0), alpha_acc, inside
 
     def render(
         self,
@@ -156,150 +225,87 @@ class GaussianRenderer:
         opacities: torch.Tensor,
         scales_3d: torch.Tensor,
         background: Optional[torch.Tensor] = None,
-        sigma_extent: float = 3.0,     
+        sigma_extent: float = 3.0,
         rotations: Optional[torch.Tensor] = None,
     ) -> RenderOutput:
-        """
-        Szybszy render, kazdy gaussian liczony tylko w lokalnym oknie, a nie na całym obrazie, ale bez mipmap i innych bajerów.
-        Renderuje obraz jako sumę 2D Gaussian splats
+        with torch.no_grad():
+            t_full = time.perf_counter()
+            self._dbg("full render start")
+            means_3d, colors, opacities, scales_3d, rotations = self._prepare_inputs(
+                means_3d, colors, opacities, scales_3d, rotations
+            )
+            H, W = camera.image_size
+            self._dbg("full render: before project")
+            uv, depth, valid_mask = camera.project(means_3d)
+            self._sync("full project")
+            self._dbg("full render: before covariance")
+            Sigma_2d = self.compute_2d_covariances(
+                camera, means_3d, scales_3d, rotations
+            )
+            self._sync("full covariance")
 
-        Każdy punkt 3D staje się Gaussianem 2D, rozmiar splatu zależy od głębokości
-        Składanie jest przez ważoną sumę + alpha normalization
-        """
-
-        means_3d = means_3d.to(self.device).float()
-        colors = colors.to(self.device).float()
-        opacities = opacities.to(self.device).float().reshape(-1, 1)
-        scales_3d = scales_3d.to(self.device).float()
-
-        
-
-        if means_3d.ndim != 2 or means_3d.shape[1] != 3:
-            raise ValueError(f"means_3d must have shape (N, 3), got {means_3d.shape}")
-        if colors.ndim != 2 or colors.shape[1] != 3:
-            raise ValueError(f"colors must have shape (N, 3), got {colors.shape}")
-        if opacities.shape[0] != means_3d.shape[0]:
-            raise ValueError("opacities must match number of gaussians")
-        if scales_3d.shape[0] != means_3d.shape[0]:
-            raise ValueError("scales_3d must match number of gaussians")
-        if scales_3d.ndim != 2 or scales_3d.shape[1] != 3:
-            raise ValueError(f"scales_3d must have shape (N, 3), got {scales_3d.shape}")
-        
-        if rotations is None:
-            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
-            rotations[:, 0] = 1.0
-        else:
-            rotations = rotations.to(self.device).float()
-
-        H, W = camera.image_size
-
-        uv, depth, valid_mask = camera.project(means_3d)
-        inside_mask = camera.in_image_mask(uv, valid_mask)
-
-        Sigma_2d = self.compute_2d_covariances(
-            camera=camera,
-            means_3d=means_3d,
-            scales_3d=scales_3d,
-            rotations=rotations,
-        )
-
-        eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
-        sigma_max = torch.sqrt(torch.clamp(eigvals[:, -1], min=1e-6))
-        margin = sigma_extent * sigma_max
-
-        image_acc = torch.zeros((H, W, 3), device=self.device, dtype=torch.float32)
-        alpha_acc = torch.zeros((H, W, 1), device=self.device, dtype=torch.float32)
-
-        valid_mask_for_render = (
-            inside_mask &
-            (uv[:, 0] + margin >= 0) &
-            (uv[:, 0] - margin < W) &
-            (uv[:, 1] + margin >= 0) &
-            (uv[:, 1] - margin < H)
-
-        )
-
-        valid_indices = torch.where(valid_mask_for_render)[0]
-
-        valid_indices = valid_indices[torch.argsort(depth[valid_indices], descending=False)]
-
-
-        valid_indices = valid_indices.tolist()
-
-        eye2 = torch.eye(2, device=self.device, dtype=torch.float32)
-
-        for idx in tqdm(valid_indices, desc="Rendering Gaussians"):
-
-            center = uv[idx]
-            color = colors[idx]
-            alpha = opacities[idx] 
-
-            cov2d = Sigma_2d[idx] + eye2 * 1e-4
-            sigma = sigma_max[idx] 
-
-            u0 = center[0].item()
-            v0 = center[1].item()
-
-            radius = max(1, int((sigma_extent * sigma).item()))
-
-            x_min = max(0, int(u0) - radius)
-            y_min = max(0, int(v0) - radius)
-            x_max = min(W, int(u0) + radius + 1)
-            y_max = min(H, int(v0) + radius + 1)
-
-            if x_min >= x_max or y_min >= y_max:
-                continue
-
-            ys = torch.arange(y_min, y_max, device=self.device, dtype=torch.float32)
-            xs = torch.arange(x_min, x_max, device=self.device, dtype=torch.float32)
-            grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-
-            du = grid_x - center[0]
-            dv = grid_y - center[1]
-
-            diff = torch.stack((du, dv), dim=2)  # (h, w, 2)
-
-            inv_cov = torch.linalg.inv(cov2d)
-
-            mahal = (
-                inv_cov[0, 0] * diff[..., 0] ** 2
-                + 2.0 * inv_cov[0, 1] * diff[..., 0] * diff[..., 1]
-                + inv_cov[1, 1] * diff[..., 1] ** 2
+            if background is None:
+                image = torch.zeros((H, W, 3), device=self.device, dtype=torch.float32)
+            else:
+                image = (
+                    background.to(self.device)
+                    .float()
+                    .view(1, 1, 3)
+                    .expand(H, W, 3)
+                    .clone()
+                )
+            alpha = torch.zeros((H, W, 1), device=self.device, dtype=torch.float32)
+            inside_any = torch.zeros(
+                (means_3d.shape[0],), device=self.device, dtype=torch.bool
             )
 
-            gaussian = torch.exp(-0.5 * mahal).unsqueeze(-1)
+            tile = max(16, int(self.full_image_tile_size))
+            chunk = max(8, int(self.full_image_gaussian_chunk))
 
-            src_alpha = torch.clamp(alpha.view(1, 1, 1) * gaussian, 0.0, 0.99)
-
-            dst_alpha = alpha_acc[y_min:y_max, x_min:x_max]
-            transmittance = 1.0 - dst_alpha
-
-            image_acc[y_min:y_max, x_min:x_max] += (
-                transmittance * src_alpha * color.view(1, 1, 3)
+            total_tiles = ((H + tile - 1) // tile) * ((W + tile - 1) // tile)
+            tile_i = 0
+            self._dbg(
+                f"full render: H={H} W={W} tile={tile} total_tiles={total_tiles} chunk={chunk}"
             )
+            for y0 in range(0, H, tile):
+                y1 = min(H, y0 + tile)
+                for x0 in range(0, W, tile):
+                    x1 = min(W, x0 + tile)
+                    tile_i += 1
+                    self._dbg(
+                        f"full tile {tile_i}/{total_tiles} x={x0}:{x1} y={y0}:{y1}"
+                    )
+                    tile_img, tile_alpha, tile_inside = (
+                        self._render_region_from_precomputed(
+                            uv=uv,
+                            depth=depth,
+                            valid_mask=valid_mask,
+                            Sigma_2d=Sigma_2d,
+                            colors=colors,
+                            opacities=opacities,
+                            x0=x0,
+                            y0=y0,
+                            x1=x1,
+                            y1=y1,
+                            background=background,
+                            sigma_extent=sigma_extent,
+                            gaussian_chunk=chunk,
+                        )
+                    )
+                    image[y0:y1, x0:x1] = tile_img
+                    alpha[y0:y1, x0:x1] = tile_alpha
+                    inside_any |= tile_inside
 
-            alpha_acc[y_min:y_max, x_min:x_max] += transmittance * src_alpha
-
-        if background is None:
-            background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
-        else:
-            background = background.to(self.device).float().view(1, 1, 3)
-
-        alpha_vis = torch.clamp(alpha_acc, 0.0, 1.0)
-
-        image = image_acc + background * (1.0 - alpha_vis)
-        image = torch.clamp(image, 0.0, 1.0)
-
-
-        return RenderOutput(
-            image=image,
-            alpha=alpha_vis,
-            uv=uv,
-            depth=depth,
-            valid_mask=valid_mask,
-            inside_mask=valid_mask_for_render,
-        )
-    
+            self._sync("full render complete")
+            self._dbg(f"full render done in {time.perf_counter() - t_full:.3f}s")
+            return RenderOutput(
+                image=image,
+                alpha=alpha,
+                uv=uv,
+                depth=depth,
+                valid_mask=valid_mask,
+                inside_mask=inside_any,
+            )
 
     def render_patch(
         self,
@@ -316,180 +322,58 @@ class GaussianRenderer:
         background: Optional[torch.Tensor] = None,
         sigma_extent: float = 3.0,
     ) -> RenderOutput:
-        """
-        Wektorowy renderer patcha.
-
-        Zamiast pętli po Gaussianach:
-            for idx in valid_indices:
-        liczymy wkład wszystkich aktywnych Gaussianów naraz.
-
-        Uwaga:
-        - point_indices mocno zalecane
-        - max_patch_points w treningu powinno być np. 500–2000
-        """
-
-        means_3d = means_3d.to(self.device).float()
-        colors = colors.to(self.device).float()
-        opacities = opacities.to(self.device).float().reshape(-1)
-        scales_3d = scales_3d.to(self.device).float()
-
-        if rotations is not None:
-            rotations = rotations.to(self.device).float()
+        t_patch = time.perf_counter()
+        self._dbg(
+            f"patch render start x={patch_x} y={patch_y} size={patch_size} point_indices={None if point_indices is None else int(point_indices.numel())}"
+        )
+        means_3d, colors, opacities, scales_3d, rotations = self._prepare_inputs(
+            means_3d, colors, opacities, scales_3d, rotations
+        )
 
         if point_indices is not None:
             point_indices = point_indices.to(self.device).long()
-
             means_3d = means_3d[point_indices]
             colors = colors[point_indices]
             opacities = opacities[point_indices]
             scales_3d = scales_3d[point_indices]
+            rotations = rotations[point_indices]
 
-            if rotations is not None:
-                rotations = rotations[point_indices]
+        H, W = camera.image_size
+        x0 = int(patch_x)
+        y0 = int(patch_y)
+        x1 = min(W, x0 + int(patch_size))
+        y1 = min(H, y0 + int(patch_size))
 
-        if means_3d.shape[0] == 0:
-            patch_h = patch_size
-            patch_w = patch_size
-            image = torch.zeros((patch_h, patch_w, 3), device=self.device)
-            alpha = torch.zeros((patch_h, patch_w, 1), device=self.device)
-            dummy = torch.empty((0,), device=self.device)
-            return RenderOutput(
-                image=image,
-                alpha=alpha,
-                uv=torch.empty((0, 2), device=self.device),
-                depth=dummy,
-                valid_mask=torch.empty((0,), dtype=torch.bool, device=self.device),
-                inside_mask=torch.empty((0,), dtype=torch.bool, device=self.device),
-            )
-
-        if scales_3d.ndim != 2 or scales_3d.shape[1] != 3:
-            raise ValueError(f"scales_3d must have shape (N, 3), got {scales_3d.shape}")
-
-        if rotations is None:
-            rotations = torch.zeros((means_3d.shape[0], 4), device=self.device)
-            rotations[:, 0] = 1.0
-
-        H_full, W_full = camera.image_size
-
-        x0 = patch_x
-        y0 = patch_y
-        x1 = min(W_full, x0 + patch_size)
-        y1 = min(H_full, y0 + patch_size)
-
-        patch_w = x1 - x0
-        patch_h = y1 - y0
-
-        if patch_w <= 0 or patch_h <= 0:
-            raise RuntimeError(f"Invalid patch size: patch_w={patch_w}, patch_h={patch_h}")
-
+        self._dbg("patch: before project")
         uv, depth, valid_mask = camera.project(means_3d)
-        inside_mask = camera.in_image_mask(uv, valid_mask)
-
-        Sigma_2d = self.compute_2d_covariances(
-            camera=camera,
-            means_3d=means_3d,
-            scales_3d=scales_3d,
-            rotations=rotations,
-        )
-
-        eigvals = torch.linalg.eigvalsh(Sigma_2d.detach())
-        sigma_max = torch.sqrt(torch.clamp(eigvals[:, -1], min=1e-6))
-        margin = sigma_extent * sigma_max
-
-        patch_mask = (
-            inside_mask
-            & (uv[:, 0] + margin >= x0)
-            & (uv[:, 0] - margin < x1)
-            & (uv[:, 1] + margin >= y0)
-            & (uv[:, 1] - margin < y1)
-        )
-
-        active_idx = torch.where(patch_mask)[0]
-
-        if active_idx.numel() == 0:
-            image = torch.zeros((patch_h, patch_w, 3), device=self.device)
-            alpha = torch.zeros((patch_h, patch_w, 1), device=self.device)
-            return RenderOutput(
-                image=image,
-                alpha=alpha,
-                uv=uv,
-                depth=depth,
-                valid_mask=valid_mask,
-                inside_mask=patch_mask,
-            )
-
-
-        active_idx = active_idx[torch.argsort(depth[active_idx], descending=False)]
-
-        uv_a = uv[active_idx]
-        colors_a = colors[active_idx]
-        opacities_a = opacities[active_idx]
-        Sigma_a = Sigma_2d[active_idx]
-
-        eye2 = torch.eye(2, device=self.device, dtype=torch.float32).unsqueeze(0)
-        Sigma_a = Sigma_a + eye2 * 1e-4
-        inv_cov = torch.linalg.inv(Sigma_a)
-
-        ys = torch.arange(y0, y1, device=self.device, dtype=torch.float32)
-        xs = torch.arange(x0, x1, device=self.device, dtype=torch.float32)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-
-        du = grid_x.unsqueeze(0) - uv_a[:, 0].view(-1, 1, 1)
-        dv = grid_y.unsqueeze(0) - uv_a[:, 1].view(-1, 1, 1)
-
-        mahal = (
-            inv_cov[:, 0, 0].view(-1, 1, 1) * du ** 2
-            + 2.0 * inv_cov[:, 0, 1].view(-1, 1, 1) * du * dv
-            + inv_cov[:, 1, 1].view(-1, 1, 1) * dv ** 2
-        )
-
-        gaussian = torch.exp(-0.5 * mahal)
-
-        alpha = torch.clamp(
-            opacities_a.view(-1, 1, 1) * gaussian,
-            0.0,
-            0.25,
-        )
-
-
-        one_minus_alpha = 1.0 - alpha + 1e-8
-
-        T = torch.cumprod(
-            torch.cat(
-                [
-                    torch.ones_like(one_minus_alpha[:1]),
-                    one_minus_alpha[:-1],
-                ],
-                dim=0,
-            ),
-            dim=0,
-        )
-
-        weights = T.detach() * alpha
-
-        image_acc = torch.sum(
-            weights.unsqueeze(-1) * colors_a.view(-1, 1, 1, 3),
-            dim=0,
-        )
-
-        alpha_acc = torch.sum(weights, dim=0).unsqueeze(-1)
-        alpha_acc = torch.clamp(alpha_acc, 0.0, 1.0)
-
-        if background is None:
-            background = torch.zeros((1, 1, 3), device=self.device, dtype=torch.float32)
-        else:
-            background = background.to(self.device).float().view(1, 1, 3)
-
-        alpha_vis = torch.clamp(alpha_acc, 0.0, 1.0)
-
-        image = image_acc + background * (1.0 - alpha_vis)
-        image = torch.clamp(image, 0.0, 1.0)
-
-        return RenderOutput(
-            image=image,
-            alpha=alpha_vis,
+        self._sync("patch project")
+        self._dbg("patch: before covariance")
+        Sigma_2d = self.compute_2d_covariances(camera, means_3d, scales_3d, rotations)
+        self._sync("patch covariance")
+        self._dbg("patch: before region render")
+        image, alpha, inside = self._render_region_from_precomputed(
             uv=uv,
             depth=depth,
             valid_mask=valid_mask,
-            inside_mask=patch_mask,
+            Sigma_2d=Sigma_2d,
+            colors=colors,
+            opacities=opacities,
+            x0=x0,
+            y0=y0,
+            x1=x1,
+            y1=y1,
+            background=background,
+            sigma_extent=sigma_extent,
+            gaussian_chunk=self.tile_gaussians,
+        )
+
+        self._sync("patch render complete")
+        self._dbg(f"patch render done in {time.perf_counter() - t_patch:.3f}s")
+        return RenderOutput(
+            image=image,
+            alpha=alpha,
+            uv=uv,
+            depth=depth,
+            valid_mask=valid_mask,
+            inside_mask=inside,
         )
